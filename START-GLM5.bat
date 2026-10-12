@@ -19,4 +19,5 @@ netstat -ano | findstr ":%PORT%" | findstr LISTENING >nul
 if not errorlevel 1 echo a server already listens on %PORT% && exit /b 0
 if not exist "build-engine" mkdir build-engine
 echo starting GLM-5.3-Flash on http://127.0.0.1:%PORT%/v1 (the first start pins the RAM tier: about a minute)
-"%PY%" "%~dp0serve\server.py" --engine strata --config "%~dp0strata-glm5.json" --port %PORT% > "%~dp0build-engine\server-glm5.log" 2>&1
+rem the server's messages go to the window and to the log (python -u: unbuffered, so "ready:" shows at once)
+"%PY%" -u "%~dp0serve\server.py" --engine strata --config "%~dp0strata-glm5.json" --port %PORT% 2>&1 | powershell -NoProfile -Command "$input | Tee-Object -FilePath '%~dp0build-engine\server-glm5.log'"

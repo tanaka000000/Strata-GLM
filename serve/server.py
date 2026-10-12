@@ -268,6 +268,12 @@ class MockEngine:
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
+        self.broken = False                              # end_broken() was called (the tests check it)
+
+    def end_broken(self, what: str) -> "EngineDied":
+        """As StrataEngine.end_broken: the mock only records it."""
+        self.broken = True
+        return EngineDied(f"{what}; the server ended the engine, the next request starts it again")
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
@@ -1624,6 +1630,23 @@ class StrataEngine:
                       "limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.", flush=True)
         else:
             state["next"] = float("inf")   # no reading (psutil missing): nothing to decide on
+
+    def end_broken(self, what: str) -> EngineDied:
+        """glm5-next (2026-10-13): a reply that is one token from its first token on (256 x '!', #606's shape) is the
+        engine's state, not the model's answer - seen right after the engine captured its 2-token window graph (RTX
+        5090, UD-IQ4_XS), and every later reply was the same until a restart.  Ended now, so the next request starts
+        it again; this request ends with the error."""
+        self.silent_note = ("The engine answered one token from the first token on (a broken state, not an answer); "
+                            "the server ended it and the next request starts it again (2026-10-13; the 2-token "
+                            "window graph).")
+        self.ended = True                               # not alive from now: the next request restarts it
+        proc = self.proc
+        try:
+            proc.kill()
+            proc.wait(timeout=20)
+        except (OSError, AttributeError, subprocess.TimeoutExpired):
+            pass
+        return EngineDied(f"{what}; the server ended the engine, the next request starts it again")
 
     def _silent(self, what: str) -> EngineSilent:
         """#481: end an engine that lost step with the server (its main thread waits for a command the server never
@@ -3157,11 +3180,32 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    # glm5-next (2026-10-13): GLM-5.3's template takes `reasoning_effort` as low / high / max (anything else is max,
+    # its default) and has no enable_thinking: every answer starts with <think>.  The server's levels map by rank
+    # (medium is GLM's middle level, High), and a request without thinking gets the thinking closed in the prompt -
+    # <think></think>, the template's own form for a turn without thinking - so the answer starts at once and the
+    # parser (thinking=False) reads it as content.  A template that handles enable_thinking itself (Qwen's) does not
+    # end its prompt with <think> when it is off, so it is left alone.  The default prompt does not change.
+    GLM_EFFORT = {"low": "low", "medium": "high", "xhigh": "max"}
+
+    def template_kwargs(self, kwargs) -> dict:
+        """The request's template kwargs with the effort in the template's own words (GLM's low / high / max)."""
+        if "effective_reasoning_effort" in self.template.source and kwargs.get("reasoning_effort") in self.GLM_EFFORT:
+            return {**kwargs, "reasoning_effort": self.GLM_EFFORT[kwargs["reasoning_effort"]]}
+        return kwargs
+
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        off = kwargs.get("enable_thinking") is False
+        prompt = self._render_prompt(messages, tools, self.template_kwargs(kwargs))
+        if off and prompt.endswith("<think>"):        # a template without enable_thinking (GLM): close it ourselves
+            prompt += "</think>"
+        return prompt
+
+    def _render_prompt(self, messages, tools, kwargs) -> str:
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -3331,10 +3375,11 @@ class Service:
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
             marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
-            effort = kwargs.get("reasoning_effort")
-            off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
-            kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+            kwargs_t = self.template_kwargs(kwargs)             # the same words as render_prompt (GLM's effort)
+            effort = kwargs_t.get("reasoning_effort")
+            off = kwargs_t.get("enable_thinking") is False      # render_prompt's rule for #458's effort_end
+            kw = ({k: v for k, v in kwargs_t.items() if k not in ("reasoning_effort", "enable_thinking")}
+                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs_t))
             kw["add_generation_prompt"] = False
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
@@ -3669,6 +3714,14 @@ class Service:
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif repeated and run_len >= n and hasattr(self.engine, "end_broken"):
+                        # glm5-next (2026-10-13): the whole reply is that one token - not a model that fell into a loop
+                        # but an engine whose state is gone (seen after its first 2-token window graph): every later
+                        # reply would be the same, so the engine is ended here and the next request starts it again
+                        print(f"[strata] the reply was one token ({self.tok.decode([run_tok])!r}) {run_len} times "
+                              "from its first token on: the engine's state is broken (seen after the 2-token window "
+                              "graph, 2026-10-13); ending the engine, the next request starts it again", flush=True)
+                        raise self.engine.end_broken(f"the reply was one token {run_len} times from its first token on")
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "

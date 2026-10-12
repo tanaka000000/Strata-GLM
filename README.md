@@ -57,6 +57,22 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
   - **Open.** The report's other symptom - the prompt read so that the model answers a different question - did not
     reproduce through this hole (a tail of finite values left the answers correct). If you can reproduce it, please
     open an issue with the prompt.
+- **Thinking off and the effort level, from the request.** GLM-5.3's template starts every answer with `<think>` and
+  has no switch for it, so a request that turned the thinking off (`chat_template_kwargs: {"enable_thinking": false}`,
+  `reasoning_effort: "none"`, Anthropic's `thinking: {"type": "disabled"}`) got the thinking anyway, streamed as the
+  answer without tags. The server now closes the thinking in the prompt (`<think></think>`, the template's own form
+  for a turn without thinking): the answer starts at once. `reasoning_effort` reaches the template in its own words:
+  `low` → Low, `medium` → High, `high` (the model's top level, as for Qwen) → Max, the default. Thinking and answer
+  were already separate (`reasoning_content` / `content`, also as SSE deltas). A request that says nothing gets the
+  same prompt as before.
+- **A broken engine is restarted (a safety net under the fix above).** On this PC (RTX 5090, UD-IQ4_XS, Windows) the
+  engine built before the fix above answered `!` forever, every request, from the moment it captured its 2-token
+  window graph (`strata verify: capturing the 2-token window` in the log; four runs out of four, with and without
+  expert skipping) - the same hole: the capture changes what lies past those matrices in VRAM. With the fix, 320
+  requests ran without it. In case it comes back in another form, the server now ends an engine whose reply is one
+  token from its first token on (`repeat_stop_tokens` of them, 256): that request gets an error, the next one starts
+  the engine again (a few minutes). A reply that falls into a one-token run after some answer is still ended as
+  `length` with the engine kept (#606's case).
 
 ### Update 2026-10-11
 

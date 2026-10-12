@@ -2020,6 +2020,24 @@ class RepeatStop(unittest.TestCase):
         self.assertEqual(done["completion_tokens"], 3 + 256)
         self.assertIn("repeated one token ('!') 256 times", log)
 
+    def test_a_reply_of_one_token_ends_the_engine(self):
+        """glm5-next (2026-10-13): one token from the first token on is the engine's broken state: the engine is
+        ended (the next request starts it again) and this request ends with the error, not a "length" reply."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "!" * 1000, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(EngineDied) as cm:
+                list(svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event()))
+        self.assertTrue(svc.engine.broken)
+        self.assertIn("256 times from its first token on", str(cm.exception))
+        self.assertIn("ending the engine", out.getvalue())
+        # a run that starts after some answer is #606's loop, not a broken engine: ended as "length", the engine kept
+        svc = Service(MockEngine(tok, "ok " + "!" * 1000, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event()) if kind == "done"][0]
+        self.assertEqual(done["finish"], "length")
+        self.assertFalse(svc.engine.broken)
+
     def test_short_runs_and_off(self):
         done, _ = self.run_reply("=" * 255 + " fine")
         self.assertEqual(done["finish"], "stop")
@@ -4910,6 +4928,52 @@ class UntimedReads(unittest.TestCase):
         v = server.Vision.__new__(server.Vision)
         v.proc = SimpleNamespace(stdout=SimpleNamespace(readline=lambda: "OK 7 1 1 1\n"))
         self.assertEqual(v._readline(5.0, "x"), "OK 7 1 1 1\n")
+
+
+class GlmThinkingControl(unittest.TestCase):
+    """glm5-next (2026-10-13): GLM-5.3's template has no enable_thinking and starts every answer with <think>, so a
+    request that turns the thinking off gets the thinking closed in the prompt (<think></think>, the template's own
+    form for a turn without thinking), and its effort words (low / high / max) come from the server's levels."""
+
+    # the lines of GLM-5.3's chat_template.jinja that matter here, with a one-line message loop
+    GLM = ("{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and "
+           "reasoning_effort in ['low', 'high'] else 'max' -%}\n"
+           "{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: "
+           "{{ effective_reasoning_effort | capitalize }}{%- endif -%}\n"
+           "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}\n"
+           "{%- if add_generation_prompt -%}<|assistant|>{{- '<think>' -}}{%- endif -%}\n")
+    CHAT = [{"role": "user", "content": "Boil an egg."}]
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        path = Path(self.dir) / "chat_template.jinja"
+        path.write_text(self.GLM, encoding="utf-8")
+        self.tok = ByteTokenizer()
+        self.svc = Service(MockEngine(self.tok, "ok", max_context=1 << 20), self.tok, ChatTemplate(path))
+        self.qwen = Service(MockEngine(self.tok, "ok", max_context=1 << 20), self.tok,
+                            ChatTemplate(ROOT / "serve/chat_template.jinja"))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def text(self, svc, **kw):
+        return self.tok.decode(svc.encode_prompt(self.CHAT, None, kw))
+
+    def test_the_default_prompt_is_the_template_as_is(self):
+        self.assertEqual(self.text(self.svc), "<|system|>Reasoning Effort: Max<|user|>Boil an egg.<|assistant|><think>")
+
+    def test_thinking_off_closes_the_thinking(self):
+        for kw in ({"enable_thinking": False}, {"enable_thinking": False, "reasoning_effort": "low"}):
+            self.assertTrue(self.text(self.svc, **kw).endswith("<|assistant|><think></think>"), kw)
+        # Qwen's template handles enable_thinking itself: its prompt is untouched
+        self.assertEqual(self.text(self.qwen, enable_thinking=False),
+                         self.tok.decode(self.tok.encode(self.qwen.template.render(self.CHAT, enable_thinking=False),
+                                                         parse_special=True)))
+
+    def test_the_effort_words(self):
+        for level, word in (("low", "Low"), ("medium", "High"), ("xhigh", "Max")):
+            self.assertTrue(self.text(self.svc, reasoning_effort=level).startswith(f"<|system|>Reasoning Effort: {word}<|user|>"), level)
+        self.assertTrue(self.text(self.svc, reasoning_effort="low").endswith("<|assistant|><think>"))  # the thinking stays on
 
 
 if __name__ == "__main__":
