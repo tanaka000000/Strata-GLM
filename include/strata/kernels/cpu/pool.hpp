@@ -218,6 +218,19 @@ public:
     /// spinning forever, and the server starts it again (issue #29).
     static constexpr std::chrono::seconds kStall{60};
 
+    /// 2026-10-17, the native phases' hand-off (all opt-in; none changes a bit of an expert's output):
+    ///   STRATA_POOL_PROF=1      - time the native phases (prof_report prints them per window)
+    ///   STRATA_POOL_NOPARK=1    - run_phase does not wait for the workers to park before and after a phase; the
+    ///                             epoch-tagged claims and wait_done already keep the batches apart (issue #29)
+    ///   STRATA_POOL_PAR_QUANT=1 - the thread that finishes an expert's last gate/up rows quantizes its intermediate,
+    ///                             instead of the host doing all of them between the phases
+    ///   STRATA_POOL_FUSE=1      - one batch a layer: the gate/up tasks, then the down tasks, each down range starting
+    ///                             once its expert's intermediate is quantized (implies PAR_QUANT; its profile's busy
+    ///                             time includes those waits)
+    bool prof() const { return prof_; }
+    /// One line of the native phases' times per window, then the counters start again.
+    void prof_report(std::FILE* f, double windows);
+
 private:
     int phase_tasks(int64_t rows) const;
     int tasks_ = 0;
@@ -296,7 +309,21 @@ private:
     bool guided_ = false;
     int etail_ = 0;
     int p_workers_ = 0;     // workers 0 .. p_workers_ - 1 run on P-cores (the pool pins the P-cores first)
-    int64_t task_bound(int i) const;
+    int64_t task_bound(int i, int64_t rows, int tasks) const;
+    // 2026-10-17: see prof() above
+    bool prof_ = false, nopark_ = false, par_quant_ = false, fuse_ = false;
+    int64_t gu_rows_ = 0;   // mode 7 (fused): tasks [0, gu_tasks_) are gate/up over gu_rows_, the rest down over mrows_
+    int gu_tasks_ = 0;
+    std::unique_ptr<std::atomic<int64_t>[]> rows_left_;   // per expert: gate/up rows still to do (PAR_QUANT)
+    std::unique_ptr<std::atomic<uint32_t>[]> hq_ready_;   // per expert: the epoch whose intermediate is quantized
+    void quant_expert(int e);
+    struct alignas(64) ThreadProf { int64_t busy = 0, first = 0; };   // one per thread (the host last)
+    std::vector<ThreadProf> tprof_;
+    struct PhaseProf {
+        int64_t phases = 0, tasks = 0, wall = 0, park = 0, drain = 0, tail = 0, repark = 0, busy = 0, wake = 0,
+                wake_max = 0, woke = 0, idle = 0;   // ns, except the counts
+    };
+    PhaseProf pprof_[3];    // gate/up (5), down (6), fused (7)
     int claim_keep(uint32_t epoch, int keep);
     // glm5-next: the native path's expert width comes from the layer's NativeFmt (GLM 2048, Qwen 640); the buffer
     // holds the widest.  The Q2_0 paths (modes 1-4) stay at FF.

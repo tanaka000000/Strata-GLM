@@ -270,8 +270,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
         iq512_glm_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
-    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= glm_from && iq256_supported(f.d_type) &&
-        std::getenv("STRATA_NO_IQ256") == nullptr) {
+    // read once: getenv takes the C runtime's environment lock, and every pool thread called it for every down range
+    // at the same moment.  2026-10-17, glm_expert_bench --pool 20 (Xeon 658X, 21 threads, 3 GLM experts x 42 layers, one
+    // token): the down rows' thread time 135-142 -> 62 ms a window (one thread alone: 55), their phase 8.6-11.0 -> 3.3 ms
+    static const bool no_iq256 = std::getenv("STRATA_NO_IQ256") != nullptr;
+    if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= glm_from && iq256_supported(f.d_type) && !no_iq256) {
         if (!glm_pair || nt != 1 || !iq256_rows_pair(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1))
             iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

@@ -6,7 +6,13 @@
 //     glm_expert_bench [--gu 21] [--down 23] [--embd 4096] [--ff 2048] [--nt 1,2,3] [--mb 512] [--reps 3]
 //                      [--threads 1,8,20] [--cpu0 2] [--stride 2]
 //     threads > 1: each thread its own experts (no sharing), pinned to logical CPUs cpu0, cpu0+stride, ...
+//
+//     glm_expert_bench --pool 20 [--per-layer 3] [--layers 42] [--nt 1] [--mb 2048] [--reps 20] [--tasks 0]
+//     the engine's pool instead (2026-10-17): run_split_multi_native on `per-layer` experts a layer, `layers` layers a
+//     window, `reps` windows; ms a window against the one-thread time over the pool's threads.  The STRATA_POOL_*
+//     variables act as in the engine (STRATA_POOL_PROF=1 prints the phases).
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +94,7 @@ Run run_experts(const NativeFmt& f, const std::vector<uint8_t>& blobs, int e0, i
 
 int main(int argc, char** argv) {
     int gu = 21, dn = 23, embd = 4096, nff = 2048, mb = 512, reps = 3, cpu0 = 2, stride = 2;
+    int pool_workers = 0, per_layer = 3, layers = 42, tasks = 0;
     std::vector<int> nts{1, 2, 3}, threads{1, 8, 20};
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string k = argv[i];
@@ -101,6 +108,10 @@ int main(int argc, char** argv) {
         else if (k == "--threads") threads = ints(argv[i + 1]);
         else if (k == "--cpu0") cpu0 = std::atoi(argv[i + 1]);
         else if (k == "--stride") stride = std::max(1, std::atoi(argv[i + 1]));
+        else if (k == "--pool") pool_workers = std::atoi(argv[i + 1]);
+        else if (k == "--per-layer") per_layer = std::max(1, std::atoi(argv[i + 1]));
+        else if (k == "--layers") layers = std::max(1, std::atoi(argv[i + 1]));
+        else if (k == "--tasks") tasks = std::atoi(argv[i + 1]);
         else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); return 2; }
     }
     NativeFmt f;
@@ -130,6 +141,44 @@ int main(int argc, char** argv) {
             hq[th].emplace_back(f.h_bytes); native_quant_h(f, hv.data(), hq[th].back().data());
             ff[th].emplace_back(nff); out[th].emplace_back(embd);
         }
+    if (pool_workers > 0) {
+        const ThreadAffinity host = pin_current_thread(planned_host_core());
+        ExpertPool pool(pool_workers, true, true, PoolAffinity::All, tasks);
+        const int th = pool.workers() + (pool.host_works() ? 1 : 0);
+        std::vector<float> outs((size_t) per_layer * maxt * embd);
+        for (int nt : nts) {
+            std::vector<ExpertJobMulti> jobs((size_t) per_layer);
+            int next = 0;
+            double ms = 0;
+            for (int rep = 0; rep <= reps; ++rep) {   // rep 0 warms up
+                if (rep == 1) { pool.prof_report(nullptr, 0); pool.ms_multi_q = 0; }
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int l = 0; l < layers; ++l) {
+                    for (int k = 0; k < per_layer; ++k) {
+                        ExpertJobMulti& j = jobs[(size_t) k];
+                        j.blob = blobs.data() + (size_t) (next++ % n_exp) * f.bytes;
+                        j.nt = nt;
+                        for (int t = 0; t < nt; ++t) {
+                            j.nact[t] = act[0][t].data();
+                            j.out[t] = outs.data() + ((size_t) k * maxt + t) * embd;
+                        }
+                    }
+                    pool.run_split_multi_native(f, jobs.data(), per_layer);
+                }
+                if (rep > 0) ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            }
+            ms /= reps;
+            const Run one = run_experts(f, blobs, 0, std::min(n_exp, 8), nt, 3, act[0], ff[0], hq[0], out[0]);
+            const double ideal = (double) layers * per_layer * (one.gu_ms + one.down_ms) / th;
+            std::printf("pool %d threads  nt %d  %d experts x %d layers: %.2f ms a window (%.3f a layer); one thread's "
+                        "time over %d threads %.2f ms (gate/up %.3f + down %.3f ms an expert)\n", th, nt, per_layer, layers,
+                        ms, ms / layers, th, ideal, one.gu_ms, one.down_ms);
+            pool.prof_report(stdout, reps);
+            pool.ms_multi_q = 0;
+        }
+        restore_thread_affinity(host);
+        return 0;
+    }
     for (int nth : threads) {
         for (int nt : nts) {
             std::vector<Run> res(nth);

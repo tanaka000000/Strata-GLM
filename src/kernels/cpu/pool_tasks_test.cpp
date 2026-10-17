@@ -14,6 +14,14 @@
 
 namespace cpu = strata::kernels::cpu;
 
+static void set_env(const char* k, const char* v) {
+#if defined(_WIN32)
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+
 int main(int argc, char** argv) {
     if (argc != 1 && argc != 4) return 2;
     cpu::NativeFmt f;
@@ -84,6 +92,29 @@ int main(int argc, char** argv) {
                     ++checks;
                 }
             }
+        // 2026-10-17: the hand-off switches (read by the pool's constructor) change no bit either
+        static const char* const knobs[] = {"STRATA_POOL_NOPARK", "STRATA_POOL_PAR_QUANT", "STRATA_POOL_FUSE",
+                                            "STRATA_POOL_GUIDED", "STRATA_POOL_PROF"};
+        for (int mask : {1, 2, 4, 4 | 8, 1 | 4 | 8 | 16, 1 | 2 | 16}) {
+            for (int k = 0; k < 5; ++k) set_env(knobs[k], (mask >> k) & 1 ? "1" : "0");
+            for (bool host : {false, true}) for (int workers : {1, 3}) for (int tasks : {0, 41}) {
+                cpu::ExpertPool pool(workers, false, host, cpu::PoolAffinity::All, tasks);
+                for (int repeat = 0; repeat < 3; ++repeat) {
+                    std::fill(out.begin(), out.end(), 0.0f);
+                    for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t)
+                        std::fill(job.out[t], job.out[t] + cpu::H, std::numeric_limits<float>::quiet_NaN());
+                    pool.run_split_multi_native(f, jobs.data(), n);
+                    if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                        std::fprintf(stderr, "mismatch n=%d switches=%d workers=%d host=%d tasks=%d repeat=%d\n",
+                                     n, mask, workers, host, tasks, repeat);
+                        return 1;
+                    }
+                    ++checks;
+                }
+                if ((mask & 16) && host && workers == 3 && tasks == 0 && n == 7) pool.prof_report(stdout, 1);
+            }
+        }
+        for (const char* k : knobs) set_env(k, "0");
     }
     std::printf("pool tasks: %d bitwise comparisons passed\n", checks);
     return 0;
