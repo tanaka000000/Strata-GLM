@@ -1264,6 +1264,8 @@ if(STRATA_NATIVE_EXPERTS)
   # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+  add_executable(glm_expert_bench src/kernels/cpu/glm_expert_bench.cpp)
+  target_link_libraries(glm_expert_bench PRIVATE strata_kernels_cpu)
   target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
