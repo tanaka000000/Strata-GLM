@@ -63,7 +63,40 @@
 #endif
 #endif
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 namespace strata::core {
+
+namespace {
+// 2026-10-14: a big copy whose destination is not read again soon (a blob assembled for the GPU): non-temporal stores
+// skip the read-for-ownership of every destination line, 3 -> 2 RAM transfers a byte.  Beside a DMA from RAM that
+// matters: 4 threads copying cost the DMA 46 -> 17 GB/s with memcpy, -> 26 GB/s with these.  STRATA_NT_COPY=0: memcpy.
+void big_copy(uint8_t* d, const uint8_t* s, size_t n) {
+#if defined(_M_X64) || defined(__x86_64__)
+    static const bool nt = [] { const char* v = std::getenv("STRATA_NT_COPY"); return v == nullptr || std::atoi(v) != 0; }();
+    if (nt && n >= (1u << 16)) {
+        const size_t head = (16 - ((uintptr_t) d & 15)) & 15;
+        std::memcpy(d, s, head);
+        d += head; s += head; n -= head;
+        const size_t body = n & ~(size_t) 63;
+        for (size_t i = 0; i < body; i += 64) {
+            const __m128i a = _mm_loadu_si128((const __m128i*) (s + i)), b = _mm_loadu_si128((const __m128i*) (s + i + 16));
+            const __m128i c = _mm_loadu_si128((const __m128i*) (s + i + 32)), e = _mm_loadu_si128((const __m128i*) (s + i + 48));
+            _mm_stream_si128((__m128i*) (d + i), a);
+            _mm_stream_si128((__m128i*) (d + i + 16), b);
+            _mm_stream_si128((__m128i*) (d + i + 32), c);
+            _mm_stream_si128((__m128i*) (d + i + 48), e);
+        }
+        _mm_sfence();
+        std::memcpy(d + body, s + body, n - body);
+        return;
+    }
+#endif
+    std::memcpy(d, s, n);
+}
+}  // namespace
 
 namespace detail {
 
@@ -505,6 +538,7 @@ bool pread_full(int fd, uint8_t* dst, uint64_t n, uint64_t off) {
 int FileExpertSource::spans(int64_t layer, int64_t expert, Span* out) const {
     if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return 0;
     if (!role_ptr_.empty()) {
+        if (unmapped_) return 0;   // the GGUF views are closed (drop_mapping)
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
@@ -958,16 +992,17 @@ void FileExpertSource::close() {
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
-            if (m.base != nullptr) UnmapViewOfFile((LPCVOID) m.base);
+            if (m.base != nullptr && !m.closed) UnmapViewOfFile((LPCVOID) m.base);
             if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
             if (m.file != nullptr) CloseHandle((HANDLE) m.file);
 #else
-            if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
+            if (m.base != nullptr && !m.closed) munmap((void*) m.base, (size_t) m.bytes);
             if (m.fd >= 0) ::close(m.fd);
 #endif
         }
         maps_.clear();
         base_ = nullptr;   // one of the views above
+        unmapped_ = false;
     }
     role_ptr_.clear();
     role_bytes_.clear();
@@ -975,6 +1010,8 @@ void FileExpertSource::close() {
     paths_.clear();
     for (void* h : direct_) close_direct(h);
     direct_.clear();
+    for (void* h : mirror_) close_direct(h);
+    mirror_.clear();
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         stage_buf_.clear();
@@ -1153,6 +1190,7 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     }
 #endif
     if (!role_ptr_.empty()) {
+        if (unmapped_) return false;   // drop_mapping closed the GGUF views: only the unbuffered reads remain
         uint64_t at = 0;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
@@ -1417,7 +1455,7 @@ void FileExpertSource::prefetch_pairs(const std::pair<int32_t, int32_t>* pairs, 
 }
 
 bool FileExpertSource::advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const {
-    if (base_ == nullptr || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
+    if (base_ == nullptr || unmapped_ || !direct_.empty() || !strata::platform::read_ahead_enabled()) return false;
     for (int64_t i = 0; pairs != nullptr && i < n; ++i) {
         const int64_t l = pairs[i].first, e = pairs[i].second;
         if (l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) continue;
@@ -1503,6 +1541,49 @@ uint64_t FileExpertSource::expert_bytes() const {
     return total;
 }
 
+void FileExpertSource::open_mirror(std::string& why) {
+#if defined(_WIN32)
+    // a copy of the shards on a second drive: each drive reads its share of every batch, so the file tier reads at the
+    // sum of the two (the copy is never mapped, so NTFS never serialises it either)
+    const char* dir = std::getenv("STRATA_MIRROR_DIR");
+    if (dir == nullptr || dir[0] == '\0' || !mirror_.empty()) return;
+    const char* sh = std::getenv("STRATA_MIRROR_SHARE");
+    const double share = sh != nullptr && sh[0] != '\0' ? std::atof(sh) : 0.5;
+    auto wide = [](const std::string& s) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        std::vector<wchar_t> w((size_t) (n > 0 ? n : 1), L'\0');
+        if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+        return w;
+    };
+    for (size_t i = 0; i < paths_.size(); ++i) {
+        const std::string& path = paths_[i];
+        const size_t cut = path.find_last_of("\\/");
+        const std::string copy = std::string(dir) + "\\" + (cut == std::string::npos ? path : path.substr(cut + 1));
+        HANDLE h = CreateFileW(wide(copy).data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
+        LARGE_INTEGER a{}, b{};
+        const bool same = h != INVALID_HANDLE_VALUE && GetFileSizeEx(h, &a) && GetFileSizeEx((HANDLE) direct_[i], &b) &&
+                          a.QuadPart == b.QuadPart;
+        if (!same) {
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+            for (void* d : mirror_) CloseHandle((HANDLE) d);
+            mirror_.clear();
+            why += "; no mirror (" + copy + " missing or of another size)";
+            return;
+        }
+        mirror_.push_back(h);
+    }
+    mirror_share_ = (uint32_t) std::clamp(share * 1024.0, 0.0, 1024.0);
+    char note[96];
+    std::snprintf(note, sizeof note, "; mirror of %zu file%s, %.0f%% of the reads", mirror_.size(),
+                  mirror_.size() == 1 ? "" : "s", 100.0 * mirror_share_ / 1024.0);
+    why += note;
+    std::fprintf(stderr, "strata: file tier mirror %s (%s)\n", dir, note + 2);
+#else
+    (void) why;
+#endif
+}
+
 bool FileExpertSource::open_direct(std::string& why) {
 #if defined(_WIN32)
     for (const std::string& path : paths_) {
@@ -1520,6 +1601,7 @@ bool FileExpertSource::open_direct(std::string& why) {
         }
         direct_.push_back(h);
     }
+    open_mirror(why);
     if (role_ptr_.empty()) {   // experts.bin: blob() now assembles into the stage buffers, sized for the largest blob
         std::lock_guard<std::mutex> lk(stage_mu_);
         for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
@@ -1593,6 +1675,8 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
     // through the file cache after all: the mapped reads take over (staged() stays true for the GGUF in place)
     for (void* d : direct_) close_direct(d);
     direct_.clear();
+    for (void* d : mirror_) close_direct(d);
+    mirror_.clear();
     return false;
 #else
     why = "through the file cache (no unbuffered reads on this platform)";
@@ -1603,7 +1687,27 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
 bool FileExpertSource::drop_mapping(std::string& why) {
 #if defined(_WIN32)
     if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
-    if (!role_ptr_.empty() || !maps_.empty()) { why = "the GGUF in place keeps its maps (token embedding, PLE)"; return false; }
+    if (!role_ptr_.empty() || !maps_.empty()) {
+        // the GGUF in place: nothing in the engine reads the shards through these views any more (the token embedding is
+        // copied into pinned host memory at load, the dense weights and the head into VRAM, the PLE table has its own
+        // reader), so every shard goes: with one mapped, NTFS runs the unbuffered reads of that file one at a time
+        if (unmapped_) { why = "already closed"; return true; }
+        for (Map& m : maps_) {
+            if (m.closed) continue;
+            if (m.base != nullptr && !UnmapViewOfFile((LPCVOID) m.base)) { why = "UnmapViewOfFile failed"; return false; }
+            m.closed = true;   // m.base stays: the read offsets are taken from it
+            if (m.mapping != nullptr) CloseHandle((HANDLE) m.mapping);
+            m.mapping = nullptr;
+            if (m.file != nullptr) CloseHandle((HANDLE) m.file);
+            m.file = nullptr;
+        }
+        unmapped_ = true;
+        char note[160];
+        std::snprintf(note, sizeof note, "%zu GGUF shard%s unmapped; every expert outside RAM and VRAM is read unbuffered",
+                      maps_.size(), maps_.size() == 1 ? "" : "s");
+        why = note;
+        return true;
+    }
     if (base_ == nullptr || unmapped_) { why = base_ == nullptr ? "not open" : "already closed"; return unmapped_; }
     if (!UnmapViewOfFile((LPCVOID) base_)) { why = "UnmapViewOfFile failed"; return false; }
     unmapped_ = true;
@@ -1615,8 +1719,22 @@ bool FileExpertSource::drop_mapping(std::string& why) {
     why = "every expert outside RAM and VRAM is read unbuffered";
     return true;
 #else
-    why = "not Windows";
-    return false;
+    // Linux's page cache has no such lock: only the tests close the GGUF views (STRATA_TEST_UNMAP_GGUF=1), to run the
+    // unmapped path the Windows file tier takes
+    const char* t = std::getenv("STRATA_TEST_UNMAP_GGUF");
+    if (t == nullptr || t[0] == ' ' || std::atoi(t) == 0 || role_ptr_.empty()) { why = "not Windows"; return false; }
+    if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
+    if (unmapped_) { why = "already closed"; return true; }
+    for (Map& m : maps_) {
+        if (m.closed) continue;
+        if (m.base != nullptr && munmap((void*) m.base, (size_t) m.bytes) != 0) { why = "munmap failed"; return false; }
+        m.closed = true;
+        if (m.fd >= 0) ::close(m.fd);
+        m.fd = -1;
+    }
+    unmapped_ = true;
+    why = std::to_string(maps_.size()) + " GGUF shard(s) unmapped (STRATA_TEST_UNMAP_GGUF); every expert outside RAM and VRAM is read unbuffered";
+    return true;
 #endif
 }
 
@@ -1690,7 +1808,12 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(HANDLE) direct_[(size_t) x.file], x.a0, x.size, total});
+        HANDLE h = (HANDLE) direct_[(size_t) x.file];
+        if (!mirror_.empty()) {   // STRATA_MIRROR_DIR: the hash of the offset picks the drive, so both see every batch
+            const uint64_t k = ((x.a0 >> 20) + (uint64_t) x.file * 0x10001ull) * 0x9E3779B97F4A7C15ull;
+            if ((uint32_t) (k >> 54) < mirror_share_) h = (HANDLE) mirror_[(size_t) x.file];
+        }
+        sc.req.push_back({h, x.a0, x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -1731,7 +1854,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     for (const Window& x : sc.win) {
         // a request may run past the end of the file: only the role's own bytes have to arrive
         if ((uint64_t) got[x.req] < x.in_req + x.skip + x.n) return false;
-        std::memcpy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
+        big_copy(x.dst + x.at, sc.buf + sc.req[x.req].pos + x.in_req + x.skip, (size_t) x.n);
     }
     return true;
 #elif defined(__linux__)
@@ -1906,7 +2029,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
             if (io_ahead_) io_enqueue(layer, e);
             continue;
         }
-        if (role_ptr_.empty()) continue;
+        if (role_ptr_.empty() || unmapped_) continue;
         for (int r = 0; r < 3; ++r) {
             const size_t i = (size_t) (3 * layer + r);
             const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * role_bytes_[i]);
@@ -1936,6 +2059,24 @@ RouterLookahead::~RouterLookahead() {
     }
     rd_cv_.notify_all();
     if (reader_.joinable()) reader_.join();
+    if (need_.load() > 0)
+        std::fprintf(stderr, "strata look-ahead: the CPU needed %lld file-tier experts, %lld of them predicted (%.1f%%); "
+                     "%lld file-tier experts predicted in all; %lld submissions skipped\n",
+                     (long long) need_.load(), (long long) hit_.load(), 100.0 * (double) hit_.load() / (double) need_.load(),
+                     (long long) guessed_.load(), (long long) skipped_.load());
+}
+
+void RouterLookahead::score(int64_t layer, const int64_t* need, int64_t n) {
+    const auto* fs = dynamic_cast<const FileExpertSource*>(src_);
+    std::lock_guard<std::mutex> lk(last_mu_);
+    if (layer < 0 || layer >= (int64_t) last_.size()) { need_ += n; return; }
+    std::vector<int64_t>& p = last_[(size_t) layer];
+    for (int64_t i = 0; i < n; ++i)
+        if (std::find(p.begin(), p.end(), need[i]) != p.end()) ++hit_;
+    need_ += n;
+    for (const int64_t e : p)
+        if (fs != nullptr && !fs->has_resident(layer, e)) ++guessed_;
+    p.clear();   // scored once: a later window predicts again
 }
 
 void RouterLookahead::set_foresight(ForesightSwap* fs) {
@@ -2111,6 +2252,11 @@ void RouterLookahead::run() {
             }
             rd_cv_.notify_one();
         }
+        {
+            std::lock_guard<std::mutex> lk(last_mu_);
+            if ((int64_t) last_.size() < n_layers_) last_.resize((size_t) n_layers_);
+            last_[(size_t) layer] = want;
+        }
         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
             for (const int64_t e : want) fs->predict(src_, layer, (int32_t) e);
         predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
@@ -2147,7 +2293,7 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
 
 double FileExpertSource::cached_share(int64_t samples) const {
 #if defined(__linux__)
-    if (role_ptr_.empty() || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
+    if (role_ptr_.empty() || unmapped_ || samples <= 0 || n_layers_ <= 0 || n_expert_ <= 0) return -1.0;
     // an even spread over the (layer, expert) grid, every page of each of the expert's three slices through mincore
     const int64_t total = (int64_t) n_layers_ * (int64_t) n_expert_;
     const int64_t n = std::min<int64_t>(samples, total);
@@ -2252,7 +2398,7 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
         return v != nullptr && std::strcmp(v, "1") == 0;
     }();
-    if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+    if (!enabled || base_ == nullptr || unmapped_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return 0;
     static const uint64_t page = [] {
         SYSTEM_INFO info{};
@@ -2483,7 +2629,7 @@ bool FileExpertSource::pin_cache_complement(
             if (fd >= 0) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         };
         if (maps_.empty()) drop(base_, mapped_bytes_, fd_);
-        else for (const Map& m : maps_) drop(m.base, m.bytes, m.fd);
+        else for (const Map& m : maps_) drop(m.closed ? nullptr : m.base, m.bytes, m.fd);
     };
 #endif
     if (bytes > 0) {
@@ -2856,8 +3002,9 @@ bool FileExpertSource::pin_cache_complement(
 #if defined(_WIN32)
     // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
     // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
-    if (maps_.empty()) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
-    for (const Map& m : maps_) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
+    // Not with the view closed (begin_startup_unbuffered): its range may hold other memory by now.
+    if (maps_.empty() && !unmapped_) (void) VirtualUnlock((LPVOID) base_, (SIZE_T) mapped_bytes_);
+    for (const Map& m : maps_) if (!m.closed) (void) VirtualUnlock((LPVOID) m.base, (SIZE_T) m.bytes);
 #endif
 
     complement_arena_ = arena;
@@ -3554,6 +3701,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         g_cpu_experts += (int64_t) miss.size();
         g_cpu_bytes += (uint64_t) miss.size() * lay.blob_bytes(d.layers);
         g_cpu_rows += rows;
+        if (d.lookahead != nullptr) {   // 2026-10-14: how many of this layer's file-tier needs the look-ahead predicted
+            static thread_local std::vector<int64_t> need;
+            need.clear();
+            const auto* nfs = dynamic_cast<const FileExpertSource*>(d.src);
+            for (const int64_t e : miss)
+                if (nfs != nullptr && !nfs->has_resident(d.layers, e)) need.push_back(e);
+            d.lookahead->score(d.layers, need.data(), (int64_t) need.size());
+        }
         const auto p0 = std::chrono::steady_clock::now();
         if (split_file) d.src->prefetch_async(d.layers, miss.data(), (int64_t) miss.size());
         else d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());

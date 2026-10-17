@@ -246,9 +246,15 @@ public:
     int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
     int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
     double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
+    /// 2026-10-14 (a count only): the file-tier experts the CPU then needed at `layer`, against the last prediction
+    /// for that layer - printed when the look-ahead stops
+    void score(int64_t layer, const int64_t* need, int64_t n);
 
 private:
     void run();
+    std::mutex last_mu_;
+    std::vector<std::vector<int64_t>> last_;   ///< the last prediction per layer (score)
+    std::atomic<int64_t> need_{0}, hit_{0}, guessed_{0};
     std::vector<std::vector<uint16_t>> routers_;
     std::vector<std::vector<float>> bias_f_;   ///< start_f32 (glm5); an empty routers_[l] = a dense layer
     int64_t n_layers_ = 0;
@@ -710,6 +716,11 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
+    /// STRATA_MIRROR_DIR: the same files on a second drive, unbuffered (Windows); a request of read_direct goes there
+    /// when the hash of its offset falls under mirror_share_ (of 1024, STRATA_MIRROR_SHARE) - two drives read at once
+    std::vector<void*> mirror_;
+    uint32_t mirror_share_ = 0;
+    void open_mirror(std::string& why);
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
     static constexpr uint64_t kNoComplement = detail::kNoCacheComplement;
@@ -718,6 +729,7 @@ private:
     struct Map {
         const uint8_t* base = nullptr;
         uint64_t bytes = 0;
+        bool closed = false;   ///< drop_mapping unmapped the view (base stays for offsets)
 #if defined(_WIN32)
         void* file = nullptr;
         void* mapping = nullptr;

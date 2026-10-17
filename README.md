@@ -37,6 +37,30 @@ and the same day: prompts at 3-33 tokens/s (86-token prompt 28 s, 4,400 tokens 1
 The "writes" numbers above use **expert skipping** (below), which changes about one token in a hundred on long
 reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt speeds do not depend on it.
 
+### Update 2026-10-14
+
+- **Please update if a question is sometimes misread, especially the first one after a start.** The same user
+  reported that with the 2026-10-13 evening build the first answer broke and the second and third did not - thank
+  you. That pattern is what the third 2026-10-13 update below fixes (clearing the state before a new conversation
+  ran on a stream the computation did not wait for); it was not yet published when they tested. We also tried
+  CUDA 13.2 here and found no difference from 12.8 in the answers (details in the 2026-10-13 update below). If you
+  notice anything that depends on the setup, we would be glad to hear it.
+- **The GGUF shards are unmapped once the expert file tier reads unbuffered** (upstream 52a2dd10). With a shard
+  mapped, NTFS serves the unbuffered reads of that file one at a time. An 892-token prompt 9.4 -> 7.9 s; the decode
+  about 10% faster (same build, interleaved).
+- **Lighter host copies in the prompt path.** The prompt's real limit is now the RAM bandwidth: a DMA from page-locked
+  RAM makes 46.6 GB/s alone and 17.0 GB/s beside 4 threads running memcpy. The blob copies use non-temporal stores
+  (`STRATA_NT_COPY=0`: memcpy) and the blob fetchers are kept across launches (`STRATA_GLM5_PF_CREW=0`: the old
+  threads). 4,829 tokens 8.3-8.7 -> 7.5-7.6 s; the decode unchanged.
+- **Optional: the expert file tier on two drives** (`STRATA_MIRROR_DIR=<folder>`: a copy of the GGUF shards on a
+  second drive; `STRATA_MIRROR_SHARE` = its share of the reads, default 0.5). Each read goes to one of the two, so
+  both drives read at once (here 4.0 + 6.9 = 10.9 GB/s). With an 80 GiB RAM tier: start 66 -> 43 s, a short prompt
+  4.1 -> 2.4 s, the decode after a 360-token follow-up +15% and after a 7,910-token prompt +25%.
+- **Optional: look-ahead in the prompt** (`STRATA_GLM5_PF_AHEAD=256` with `STRATA_GLM5_PREFILL=8192`,
+  `--vram-reserve-mib 10000`, `STRATA_GLM5_PF_TOUCH=32`): 7,910 tokens 10.1 -> 8.3 s, but that reserve costs the
+  decode 6-7%, and with less reserve the 8192 chunk falls off a cliff (6,400 MiB: 263 s). For long-prompt work only.
+- Checked (RTX 5090): over 50 answers correct across the default settings and the two-drive one.
+
 ### Update 2026-10-13
 
 - **Fix: answers that were sometimes nothing but "!!!!" (please update).** A user reported that answers broke at
@@ -54,9 +78,39 @@ reasoning. With it off the short-chat answer is **20 tokens/s**; the prompt spee
     whose tail is 0xFF answered "!!!!" to all 4; a 0x00 or 0x3C tail answered all 4 correctly, and so did the fix.
     The prompt time is unchanged (4,829 tokens: 11.6 s before, 11.1-12.1 s after).
   - **`STRATA_GLM5_PF_MMQ=0` is no longer needed** (it also takes the routed experts off MMQ, which slows the prompt).
-  - **Open.** The report's other symptom - the prompt read so that the model answers a different question - did not
-    reproduce through this hole (a tail of finite values left the answers correct). If you can reproduce it, please
-    open an issue with the prompt.
+- **Second fix (evening): saved prompt states are tied to the build (please update, and empty the slot folder
+  once).** The same user then reported that the "!!!!" answers were gone but the model still sometimes misread the
+  question - thank you again.
+  - **The likely cause.** With `STRATA_GLM5_SLOT_DIR` set (it is in the example settings: `build-engine\glm5-slots`), the server keeps a
+    prompt's state in files and reads them back after a restart. Those files were matched by model, pack and format,
+    **but not by build**: a state written by a build with the over-read above was read by the fixed build, wrong
+    numbers and all. Now a slot file of another build is not read, and the start says how many such files are left
+    (`... not read (safe to delete)`). We could not reproduce the misreading itself here, so this is the most likely
+    cause, not a proven one.
+  - **Also fixed.** When a prompt failed with "do not fit" or "page-locked", part of it was already in the state, but
+    the server still thought it held the previous conversation; the next request could go on from that. It now starts
+    that request over.
+  - **Checked** (RTX 5090, one slot folder): the old build wrote a 4,828-token slot; the new build said
+    "1 slot file(s) ... not read" and read the prompt again; a second start of the new build read its own slot
+    (4,828 tokens in 135 ms). All 12 answers correct.
+  - **No difference found in our measurements**: CUDA 13.2 vs 12.8, and MMQ on vs off. The next-token probabilities
+    moved about as much as they do between two runs of the same settings (mean KL 0.018-0.028 vs 0.014-0.017).
+  - If the misreading still happens after this, please open an issue with the prompt.
+- **Third update (night): fixes taken from upstream Strata and [Project Maya](https://github.com/mw00/project-maya).**
+  - **A new conversation could start from the previous one's state.** Clearing the state, restoring a snapshot and
+    reading a slot file ran on a different GPU stream from the computation, which did not wait for them, so the next
+    prompt could read the old state while it was still being overwritten. This is another likely cause of the
+    misread questions (Maya found the same pattern answering another conversation's question). They now run on the
+    compute stream and are waited for.
+  - **NaN guard** (after upstream #879): every window's output is checked; a window with NaN / Inf sends none of its
+    tokens, the reply ends ("nonfinite"), and the state, the snapshot and the slot files that held it are dropped,
+    so the next request starts clean. Its cost is within run-to-run noise. `STRATA_NAN_GUARD=0` turns it off.
+  - **GLM's tool tags inside a message are text** (`<tool_call>`, `<arg_key>`, `<arg_value>`, `<tool_response>` and
+    their closing tags; upstream #2026 widened as Maya does): a file or a message containing them no longer ends the
+    model's tool call or reply.
+  - From upstream: a tool list sent in another order keeps its first order (the prompt cache survives, #1624), and a
+    keep-alive is sent while a long tool argument is being written (client timeouts, #1666).
+  - Checked (RTX 5090): 28 answers correct over 7 starts, including a forced NaN window; the server tests pass (284).
 - **Thinking off and the effort level, from the request.** GLM-5.3's template starts every answer with `<think>` and
   has no switch for it, so a request that turned the thinking off (`chat_template_kwargs: {"enable_thinking": false}`,
   `reasoning_effort: "none"`, Anthropic's `thinking: {"type": "disabled"}`) got the thinking anyway, streamed as the
