@@ -126,8 +126,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> blobs((size_t) n_exp * f.bytes);
     std::mt19937_64 rng(12345);
     for (size_t i = 0; i < blobs.size(); i += 8) { const uint64_t v = rng(); std::memcpy(blobs.data() + i, &v, std::min<size_t>(8, blobs.size() - i)); }
-    // the fp16 scales of every block would be random bit patterns (NaN, huge): harmless for the timing, but keep them
-    // finite by clearing the exponent's top bits of each 16-bit word that is a block's d (the first two bytes of a block)
+    // the blocks' fp16 scales are random bit patterns (some NaN or huge): the outputs are meaningless, the timing is not
+    // (the kernels do the same work for any bits)
     std::vector<float> x(embd), hv(nff);
     for (auto& v : x) v = (float) ((int) (rng() % 2001) - 1000) / 1000.f;
     for (auto& v : hv) v = (float) ((int) (rng() % 2001) - 1000) / 1000.f;

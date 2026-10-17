@@ -13466,10 +13466,11 @@ int main(int argc, char** argv) {
                                              "%.1f GB/s over the CPU-expert time\n", cx / w, cr / w, cb / w / 1e6,
                                      v.ms_pool > 0 ? (double) cb / (v.ms_pool / 1000.0) / 1e9 : 0.0);
                     if (cx > 0)
-                        std::fprintf(stderr, "strata serve: CPU pool per window: gate/up %.2f  quantize %.2f  down %.2f ms; "
+                        std::fprintf(stderr, "strata serve: CPU pool per window: gate/up %.2f  quantize %.2f  down %.2f ms%s; "
                                              "dispatch plan %.2f  act-quant %.2f  jobs %.2f  run %.2f ms\n",
-                                     pool.ms_multi_gu / w, pool.ms_multi_q / w, pool.ms_multi_down / w, drive.d.ms_plan / w,
-                                     drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
+                                     pool.ms_multi_gu / w, pool.ms_multi_q / w, pool.ms_multi_down / w,
+                                     pool.fused() ? " (STRATA_POOL_FUSE: down and quantize are in gate/up)" : "",
+                                     drive.d.ms_plan / w, drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
                     if (cx > 0) pool.prof_report(stderr, w);   // STRATA_POOL_PROF=1 only
                     std::fprintf(stderr, "strata serve: adapt per window: %.2f ms (%.1f swaps), waiting for its copies %.2f ms\n",
                                  ms_adapt / w, (double) swaps_total / w, ms_pending_wait / w);
