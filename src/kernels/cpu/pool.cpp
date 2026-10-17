@@ -416,7 +416,7 @@ void ExpertPool::diag(std::FILE* f) const {
     const uint64_t h = head_.load();
     std::fprintf(f, "  expert pool: epoch %u, batch epoch %u: %u of %u jobs claimed, %u done; %u of %d workers parked, "
                     "%u sleeping; mode %d\n", epoch_.load(), (uint32_t) (h >> 32), (uint32_t) h & 0xffffu,
-                 (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_);
+                 (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_.load());
     std::fprintf(f, "  expert pool threads:");
     for (int i = 0; i < n_; ++i) {
         const int32_t s = wstate_[(size_t) i].load();
@@ -700,8 +700,26 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 // fused: a down range waits for its expert's intermediate.  Every gate/up task was claimed before any
                 // down task and none of them waits, so this always ends; a stuck one trips wait_done's kStall.
-                if (mode_ == 7 && !gu)
-                    while (hq_ready_[(size_t) e].load(std::memory_order_acquire) != epoch) _mm_pause();
+                if (mode_ == 7 && !gu) {
+                    // 2026-10-17 (review): bounded like wait_done - the host may be the one waiting here, and then
+                    // wait_done's kStall never runs; a stall stops the engine for a restart instead of hanging (issue #29)
+                    uint32_t spins = 0;
+                    std::chrono::steady_clock::time_point t0{};
+                    while (hq_ready_[(size_t) e].load(std::memory_order_acquire) != epoch) {
+                        _mm_pause();
+                        if ((++spins & 1023u) != 0) continue;
+                        const auto now = std::chrono::steady_clock::now();
+                        if (spins == 1024u) t0 = now;
+                        else if (now - t0 > kStall) {
+                            std::fprintf(stderr, "strata: the CPU expert pool stalled: a fused down range waited for expert "
+                                                 "%d's intermediate - stopping the engine so the server can start it again "
+                                                 "(issue #29)\n", e);
+                            strata::core::release_gpu_waits(stderr);   // #267
+                            std::fflush(stderr);
+                            std::abort();
+                        }
+                    }
+                }
                 if (gu && q2_native_kernels(nfmt_->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
@@ -900,8 +918,16 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        if (par_quant_)
-            for (int e = 0; e < nb; ++e) rows_left_[(size_t) e].store(f.n_ff, std::memory_order_relaxed);
+        if (par_quant_) {
+            // 2026-10-17 (review F1): hq_ready_ holds the epoch whose intermediate is quantized; reset it to the CURRENT
+            // epoch, which the batch published next (epoch + 1) never equals, so a 2^32 wrap cannot let a down range pass
+            // on a stale mark.  The previous batch is done (wait_done) and nobody claims until the publish below.
+            const uint32_t cur = epoch_.load(std::memory_order_relaxed);
+            for (int e = 0; e < nb; ++e) {
+                rows_left_[(size_t) e].store(f.n_ff, std::memory_order_relaxed);
+                hq_ready_[(size_t) e].store(cur, std::memory_order_relaxed);
+            }
+        }
         if (fuse_) {   // one batch: the gate/up tasks, then the down tasks (the gate/up time is all of it)
             gu_rows_ = (int64_t) nb * f.n_ff;
             gu_tasks_ = phase_tasks(gu_rows_);

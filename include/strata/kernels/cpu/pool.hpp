@@ -291,7 +291,7 @@ private:
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
-    int mode_ = 0;
+    std::atomic<int> mode_{0};   // atomic: under STRATA_POOL_NOPARK a late worker may read it while the host writes
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {
         alignas(64) float ff[FF];
@@ -312,6 +312,9 @@ private:
     int64_t task_bound(int i, int64_t rows, int tasks) const;
     // 2026-10-17: see prof() above
     bool prof_ = false, nopark_ = false, par_quant_ = false, fuse_ = false;
+  public:
+    bool fused() const { return fuse_; }   // STRATA_POOL_FUSE: ms_multi_down is 0 (the down rows are in ms_multi_gu)
+  private:
     int64_t gu_rows_ = 0;   // mode 7 (fused): tasks [0, gu_tasks_) are gate/up over gu_rows_, the rest down over mrows_
     int gu_tasks_ = 0;
     std::unique_ptr<std::atomic<int64_t>[]> rows_left_;   // per expert: gate/up rows still to do (PAR_QUANT)
