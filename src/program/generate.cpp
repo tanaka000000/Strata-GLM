@@ -13379,6 +13379,7 @@ int main(int argc, char** argv) {
                 // decode: windows of one token (and the suffix lookup's drafts)
                 { int64_t a, r; uint64_t b; strata::core::expert_pool_cpu_stats(a, b, r); }   // drop the prompt's counts
                 pool.ms_multi_gu = pool.ms_multi_q = pool.ms_multi_down = 0;
+                pool.prof_report(nullptr, 0);   // STRATA_POOL_PROF: drop the prompt's phases too
                 drive.d.ms_plan = drive.d.ms_actq = drive.d.ms_jobs = drive.d.ms_run = 0;
                 { double a, b; int64_t r; strata::core::expert_pool_jobs_stats(a, b, r); }
                 ms_adapt = 0; swaps_total = 0; ms_pending_wait = 0;
@@ -13469,6 +13470,7 @@ int main(int argc, char** argv) {
                                              "dispatch plan %.2f  act-quant %.2f  jobs %.2f  run %.2f ms\n",
                                      pool.ms_multi_gu / w, pool.ms_multi_q / w, pool.ms_multi_down / w, drive.d.ms_plan / w,
                                      drive.d.ms_actq / w, drive.d.ms_jobs / w, drive.d.ms_run / w);
+                    if (cx > 0) pool.prof_report(stderr, w);   // STRATA_POOL_PROF=1 only
                     std::fprintf(stderr, "strata serve: adapt per window: %.2f ms (%.1f swaps), waiting for its copies %.2f ms\n",
                                  ms_adapt / w, (double) swaps_total / w, ms_pending_wait / w);
                     std::fprintf(stderr, "strata serve: adapt parts per window: choose %.2f ms, copies back + wait %.2f ms, "
