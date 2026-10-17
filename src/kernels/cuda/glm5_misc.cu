@@ -30,6 +30,43 @@ __global__ void __launch_bounds__(256) f32_gemv_kernel(const float* __restrict__
     }
 }
 
+// STRATA_F32_GEMV_FAST=1 (2026-10-17, opt-in; 1-4 tokens): the same warp-per-row sums with two warps per block (the
+// router's 288 rows on 144 blocks, not 36), each weight value loaded once for every token, and 8 loads issued before
+// they are used.  Each token's FMA chain runs over i = lane, lane + 32, ... in the same order as above, and the same
+// xor tree: bitwise f32_gemv_kernel's output.
+template <int NT>
+__global__ void __launch_bounds__(64) f32_gemv_fast_kernel(const float* __restrict__ w, const float* __restrict__ x,
+                                                           float* __restrict__ y, int n_in, int n_out, float scale) {
+    constexpr int U = 8;
+    const int o = blockIdx.x * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (o >= n_out) return;
+    const float* wr = w + (size_t) o * n_in;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    int i = lane;
+    for (; i + 32 * (U - 1) < n_in; i += 32 * U) {
+        float wv[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) wv[u] = wr[i + 32 * u];
+#pragma unroll
+        for (int t = 0; t < NT; ++t)
+#pragma unroll
+            for (int u = 0; u < U; ++u) acc[t] = fmaf(wv[u], x[(size_t) t * n_in + i + 32 * u], acc[t]);
+    }
+    for (; i < n_in; i += 32) {
+        const float wv = wr[i];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] = fmaf(wv, x[(size_t) t * n_in + i], acc[t]);
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        float a = acc[t];
+        for (int s = 16; s > 0; s >>= 1) a += __shfl_xor_sync(0xffffffffu, a, s);
+        if (lane == 0) y[(size_t) t * n_out + o] = a * scale;
+    }
+}
+
 __global__ void transpose_abd_kernel(const float* __restrict__ src, float* __restrict__ dst, int a, int b, int d) {
     const int ia = blockIdx.y, ib = blockIdx.z;
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < d; k += gridDim.x * blockDim.x)
@@ -92,6 +129,19 @@ void glm5_latent_store_q4(const float* kv, uint8_t* pool, const int32_t* page_ta
 }
 
 void glm5_f32_gemv(const float* w, const float* x, float* y, int n_in, int n_out, int n_tok, float scale, void* stream) {
+    static const bool fast = [] { const char* v = std::getenv("STRATA_F32_GEMV_FAST"); return v && v[0] == '1'; }();
+    if (fast && n_tok >= 1 && n_tok <= 4) {
+        const unsigned g = (unsigned) ((n_out + 1) / 2);
+        cudaStream_t s = (cudaStream_t) stream;
+        switch (n_tok) {
+            case 1: f32_gemv_fast_kernel<1><<<g, 64, 0, s>>>(w, x, y, n_in, n_out, scale); break;
+            case 2: f32_gemv_fast_kernel<2><<<g, 64, 0, s>>>(w, x, y, n_in, n_out, scale); break;
+            case 3: f32_gemv_fast_kernel<3><<<g, 64, 0, s>>>(w, x, y, n_in, n_out, scale); break;
+            default: f32_gemv_fast_kernel<4><<<g, 64, 0, s>>>(w, x, y, n_in, n_out, scale); break;
+        }
+        check("glm5_f32_gemv");
+        return;
+    }
     f32_gemv_kernel<<<(unsigned) ((n_out + 7) / 8), 256, 0, (cudaStream_t) stream>>>(w, x, y, n_in, n_out, n_tok, scale);
     check("glm5_f32_gemv");
 }

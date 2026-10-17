@@ -133,14 +133,20 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// x_q8_1 + b * x_stride_bytes and writes y + b * y_stride; each member bitwise native_mmvq(8, ..., ncols = 1) on
 /// its slice.  Returns false (nothing launched) for a stride that is not whole blocks, n_in not a multiple of 32, or
 /// n_batch outside 1..65535.
+/// 2026-10-17: ncols 2..8 columns per member, each member bitwise native_mmvq(8, ..., ncols) on its columns.  Column j
+/// of member b reads x_q8_1 + b * x_stride_bytes + j * x_col_bytes and writes y + b * y_stride + j * y_col (0: the
+/// contiguous columns, n_in / 32 blocks and n_out floats), so [token][member] layouts need no transpose.  false
+/// (nothing launched) also for ncols outside 1..8, or ncols > 1 outside the exact layout (native_mmvq_set_multi_exact).
 bool native_mmvq_batched_q8_0(const void* weights, std::size_t w_stride_bytes, const void* x_q8_1,
                               std::size_t x_stride_bytes, float* y, std::size_t y_stride, int n_in, int n_out,
-                              int n_batch, void* stream);
+                              int n_batch, void* stream, int ncols = 1, std::size_t x_col_bytes = 0,
+                              std::size_t y_col = 0);
 /// 2026-10-10: up to 8 single-column Q8_0 products of the SAME input in ONE launch - member b: weights[b] (n_out[b]
 /// rows of n_in) into y[b]; each bitwise native_mmvq(8, ..., ncols = 1).  Returns false (nothing launched) for
-/// n_batch outside 1..8, a null member or n_in not a multiple of 32.
+/// n_batch outside 1..8, a null member or n_in not a multiple of 32.  2026-10-17: ncols 2..8 contiguous columns of x
+/// (each member bitwise native_mmvq(8, ..., ncols)); false for ncols outside 1..8 or ncols > 1 outside the exact layout.
 bool native_mmvq_table_q8_0(const void* const* weights, const int* n_out, int n_batch, const void* x_q8_1,
-                            float* const* y, int n_in, void* stream);
+                            float* const* y, int n_in, void* stream, int ncols = 1);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

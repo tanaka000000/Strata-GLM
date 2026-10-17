@@ -229,6 +229,12 @@ bool Glm5Mtp::init(const WeightTable& wt, const ModelGeometry& g, const NativeHe
     return true;
 }
 
+// STRATA_GLM5_MTP_BATCH=1 (2026-10-17, opt-in): the drafter's DSA block as the verify window's batched one - the four
+// projections of x in one launch, the 64 per-head wk_b / wv_b products in one launch each reading and writing the
+// [row][head] layouts (no transposes), the shared expert's gate and up in one launch.  Every value bitwise the
+// default's; the drafter runs outside a graph, so this removes ~130 launches per layer() call.
+static const bool mtp_batch = [] { const char* v = std::getenv("STRATA_GLM5_MTP_BATCH"); return v && v[0] == '1'; }();
+
 // The NextN layer over n rows: tokens tok_dev (device) at cells c0+1.., h rows h_in (device) -> m.hp (h') and
 // m.out_tok (argmax), the drafter's cache written at cells c0 ..
 bool Glm5Mtp::layer(const int32_t* tok_dev, const float* h_in, int n, int64_t c0, std::string& err) {
@@ -254,23 +260,40 @@ bool Glm5Mtp::layer(const int32_t* tok_dev, const float* h_in, int n, int64_t c0
         // ---- DSA (verify_glm5.cpp's block)
         native_qsa_rms_norm_weighted(m.u, (const float*) m.an->data, m.x, (int) N, n, m.rms_eps, cs);
         native_quantize_q8_1(m.x, m.q8, (int) N, n, cs);
-        native_mmvq(m.wqa->native_type, m.wqa->native_data, m.q8, m.qr, (int) N, (int) QLR, n, cs);
-        native_mmvq(m.wkv->native_type, m.wkv->native_data, m.q8, m.kv, (int) N, (int) KVR, n, cs);
-        native_mmvq(m.wik->native_type, m.wik->native_data, m.q8, m.rk, (int) N, (int) ID, n, cs);
-        native_mmvq(m.wig->native_type, m.wig->native_data, m.q8, m.rg, (int) N, (int) ID, n, cs);
+        {
+            const WeightRef* ws[4] = {m.wqa, m.wkv, m.wik, m.wig};
+            const void* wp[4];
+            float* yp[4] = {m.qr, m.kv, m.rk, m.rg};
+            const int no[4] = {(int) QLR, (int) KVR, (int) ID, (int) ID};
+            bool q8 = mtp_batch;
+            for (int i = 0; i < 4; ++i) { q8 = q8 && ws[i]->native_type == 8; wp[i] = ws[i]->native_data; }
+            if (!(q8 && native_mmvq_table_q8_0(wp, no, 4, m.q8, yp, (int) N, cs, n)))
+                for (int i = 0; i < 4; ++i)
+                    native_mmvq(ws[i]->native_type, ws[i]->native_data, m.q8, yp[i], (int) N, no[i], n, cs);
+        }
         native_qsa_rms_norm_weighted(m.qr, (const float*) m.wqan->data, m.qr, (int) QLR, n, m.rms_eps, cs);
         native_qsa_rms_norm_weighted(m.kv, (const float*) m.wkvn->data, m.kv, (int) KVR, n, m.rms_eps, cs);
         glm5_latent_store(m.kv, m.latent, m.page_table, m.steps, kStepCount, 4, (int) KVR, n, cs);
+        // direct: the per-head products read / write the [row][head] layouts with strides (row t, head h = t * NH + h)
+        const bool direct = mtp_batch && n <= 8 && m.wkb->native_type == 8 && m.wvb->native_type == 8;
         mmvq(m.wqb, m.qr, (int) QLR, m.qb, (int) (NH * QK));
-        glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);
-        native_quantize_q8_1(m.qT, m.q8, (int) (QK * NH * n), 1, cs);
+        if (!direct) glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);
+        native_quantize_q8_1(direct ? m.qb : m.qT, m.q8, (int) (QK * NH * n), 1, cs);
         {
             const size_t row = (size_t) (QK / 32) * 34, qcol = (size_t) (QK / 32) * 36;
-            for (int64_t h = 0; h < NH; ++h)
-                native_mmvq(m.wkb->native_type, (const uint8_t*) m.wkb->native_data + (size_t) h * KVR * row,
-                            m.q8 + (size_t) h * n * qcol, m.qaT + (size_t) h * n * KVR, (int) QK, (int) KVR, n, cs);
+            if (direct) {
+                if (!native_mmvq_batched_q8_0(m.wkb->native_data, (size_t) KVR * row, m.q8, qcol, m.qa, (size_t) KVR,
+                                              (int) QK, (int) KVR, (int) NH, cs, n, NH * qcol, (size_t) (NH * KVR))) {
+                    err = "glm5 mtp: the batched wk_b launch was refused";
+                    return false;
+                }
+            } else {
+                for (int64_t h = 0; h < NH; ++h)
+                    native_mmvq(m.wkb->native_type, (const uint8_t*) m.wkb->native_data + (size_t) h * KVR * row,
+                                m.q8 + (size_t) h * n * qcol, m.qaT + (size_t) h * n * KVR, (int) QK, (int) KVR, n, cs);
+            }
         }
-        glm5_transpose_abd(m.qaT, m.qa, (int) NH, n, (int) KVR, cs);
+        if (!direct) glm5_transpose_abd(m.qaT, m.qa, (int) NH, n, (int) KVR, cs);
         const Glm5KpoolBuffers kb{m.tail, m.pooled};
         for (int t = 0; t < n; ++t)
             glm5_kpool_append(m.rk + (size_t) t * ID, m.rg + (size_t) t * ID, m.steps + (size_t) t * kStepCount + kStepPos,
@@ -282,15 +305,23 @@ bool Glm5Mtp::layer(const int32_t* tok_dev, const float* h_in, int n, int64_t c0
         qsa_block_topk(m.scores, m.steps, n, m.max_blocks, m.cap, m.s, m.sel, cs);
         mla_decode_attn_batch(m.qa, m.latent, m.page_table, 4, m.sel, m.steps, m.cap, (int) NH, 1.0f / std::sqrt((float) QK),
                               m.mla_scratch, m.lat, n, cs);
-        glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);
-        native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
+        if (!direct) glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);
+        native_quantize_q8_1(direct ? m.lat : m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
         {
             const size_t row = (size_t) (KVR / 32) * 34, qcol = (size_t) (KVR / 32) * 36;
-            for (int64_t h = 0; h < NH; ++h)
-                native_mmvq(m.wvb->native_type, (const uint8_t*) m.wvb->native_data + (size_t) h * VD * row,
-                            m.q8 + (size_t) h * n * qcol, m.vbT + (size_t) h * n * VD, (int) KVR, (int) VD, n, cs);
+            if (direct) {
+                if (!native_mmvq_batched_q8_0(m.wvb->native_data, (size_t) VD * row, m.q8, qcol, m.vb, (size_t) VD,
+                                              (int) KVR, (int) VD, (int) NH, cs, n, NH * qcol, (size_t) (NH * VD))) {
+                    err = "glm5 mtp: the batched wv_b launch was refused";
+                    return false;
+                }
+            } else {
+                for (int64_t h = 0; h < NH; ++h)
+                    native_mmvq(m.wvb->native_type, (const uint8_t*) m.wvb->native_data + (size_t) h * VD * row,
+                                m.q8 + (size_t) h * n * qcol, m.vbT + (size_t) h * n * VD, (int) KVR, (int) VD, n, cs);
+            }
         }
-        glm5_transpose_abd(m.vbT, m.vb, (int) NH, n, (int) VD, cs);
+        if (!direct) glm5_transpose_abd(m.vbT, m.vb, (int) NH, n, (int) VD, cs);
         mmvq(m.wo, m.vb, (int) (NH * VD), m.ao, (int) N);
         add_inplace(m.u, m.ao, (int64_t) n * N, cs);
         // ---- FFN: the shared expert (phase A: no routed experts)
@@ -298,7 +329,7 @@ bool Glm5Mtp::layer(const int32_t* tok_dev, const float* h_in, int n, int64_t c0
         NativeSharedWeights nsw;
         nsw.gate_type = m.wsg->native_type; nsw.gate_data = m.wsg->native_data; nsw.up_type = m.wsu->native_type;
         nsw.up_data = m.wsu->native_data; nsw.down_type = m.wsd->native_type; nsw.down_data = m.wsd->native_data; nsw.q8_1 = m.q8;
-        shared_expert_multi(n, m.x, nullptr, nsw, nullptr, m.sg, m.su, m.sgs, m.sh, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
+        shared_expert_multi(n, m.x, nullptr, nsw, nullptr, m.sg, m.su, m.sgs, m.sh, N, m.NFF, cs, nullptr, mtp_batch ? 6 : 0, m.clamp_sh);
         if (m.experts != nullptr) {   // phase B: the routed experts, all on the GPU
             const int64_t K = m.K, cap = (int64_t) n * K;
             glm5_f32_gemv((const float*) m.wr->data, m.x, m.rlog, (int) N, (int) m.NE, n, 1.0f, cs);

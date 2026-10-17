@@ -63,6 +63,17 @@ static const bool absorb_batch = [] { const char* v = std::getenv("STRATA_GLM5_A
 // the projections that share an input (KDA: q, k, v, f_a, g_a, beta; DSA: q_a, kv_a, indexer k, gate) in one launch
 // each for a one-token window (2026-10-10; bitwise the separate launches).  STRATA_GLM5_PROJ_BATCH=0: separate
 static const bool proj_batch = [] { const char* v = std::getenv("STRATA_GLM5_PROJ_BATCH"); return !(v && v[0] == '0'); }();
+// STRATA_GLM5_BATCH_MAXT=2..8 (2026-10-17, opt-in; default 1 = one-token windows only): the two batched paths above
+// also for windows of up to this many tokens (an MTP window's 2-3), each token's values bitwise the separate calls'.
+// With the absorb batch on, such a window's MLA products also read and write the [token][head] layouts directly
+// (no glm5_transpose_abd; the same values).
+static const int batch_maxt = [] { const char* v = std::getenv("STRATA_GLM5_BATCH_MAXT"); const int x = v ? std::atoi(v) : 1; return x < 1 ? 1 : x > 8 ? 8 : x; }();
+// STRATA_GLM5_SKIP_T1=1 (2026-10-17, opt-in): a one-token window skips the four glm5_transpose_abd of a DSA layer (with
+// one token [t][h] and [h][t] are the same array; bitwise the same)
+static const bool skip_t1 = [] { const char* v = std::getenv("STRATA_GLM5_SKIP_T1"); return v && v[0] == '1'; }();
+// STRATA_GLM5_SHEXP_PAIR=1 (2026-10-17, opt-in): the shared expert's (and the dense FFN's) gate and up in one launch -
+// one token: a two-member table, 2-8 tokens: native_mmvq_pair (shared_expert_multi's lfuse bits 2 and 1; bitwise)
+static const int shexp_lfuse = [] { const char* v = std::getenv("STRATA_GLM5_SHEXP_PAIR"); return v && v[0] == '1' ? 6 : 0; }();
 
 struct Verifier::Glm5 {
     // geometry (from the GGUF)
@@ -312,9 +323,9 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
                 const void* wp[6];
                 float* yp[6] = {m.q, m.k, m.v, m.fa, m.ga, m.bl};
                 const int no[6] = {(int) m.DI, (int) m.DI, (int) m.DI, 128, 128, (int) m.H};
-                bool q8 = n == 1 && proj_batch;
+                bool q8 = n <= batch_maxt && proj_batch;
                 for (int i = 0; i < 6; ++i) { q8 = q8 && ws[i]->native_type == 8; wp[i] = ws[i]->native_data; }
-                if (!(q8 && native_mmvq_table_q8_0(wp, no, 6, xq_, yp, (int) N, cs)))
+                if (!(q8 && native_mmvq_table_q8_0(wp, no, 6, xq_, yp, (int) N, cs, n)))
                     for (int i = 0; i < 6; ++i)
                         native_mmvq(ws[i]->native_type, ws[i]->native_data, xq_, yp[i], (int) N, no[i], n, cs);
             }
@@ -352,9 +363,9 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
                 const void* wp[4];
                 float* yp[4] = {m.qr, m.kv, rk, rg};
                 const int no[4] = {(int) QLR, (int) KVR, (int) ID, (int) ID};
-                bool q8 = n == 1 && proj_batch;
+                bool q8 = n <= batch_maxt && proj_batch;
                 for (int i = 0; i < 4; ++i) { q8 = q8 && ws[i]->native_type == 8; wp[i] = ws[i]->native_data; }
-                if (!(q8 && native_mmvq_table_q8_0(wp, no, 4, xq_, yp, (int) N, cs)))
+                if (!(q8 && native_mmvq_table_q8_0(wp, no, 4, xq_, yp, (int) N, cs, n)))
                     for (int i = 0; i < 4; ++i)
                         native_mmvq(ws[i]->native_type, ws[i]->native_data, xq_, yp[i], (int) N, no[i], n, cs);
             }
@@ -362,21 +373,35 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             native_qsa_rms_norm_weighted(m.kv, (const float*) wkvn->data, m.kv, (int) KVR, n, m.rms_eps, cs);
             if (m.lat_q4) glm5_latent_store_q4(m.kv, lat_pool, m.page_table, step_, kStepCount, 4, (int) KVR, n, cs);
             else glm5_latent_store(m.kv, (uint16_t*) lat_pool, m.page_table, step_, kStepCount, 4, (int) KVR, n, cs);
+            // the per-head products in one launch each (absorb batch), and whether they read / write the [t][h] layouts
+            // directly (one token with STRATA_GLM5_SKIP_T1, or 2..BATCH_MAXT tokens batched): no transposes
+            const bool abat = n <= batch_maxt && absorb_batch && wkb->native_type == 8 && wvb->native_type == 8;
+            const bool direct = n == 1 ? skip_t1 : abat;
+            float* qT = direct ? m.qb : m.qT;     // [h][t][QK]   (direct: [t][h][QK], read with strides)
+            float* qaT = direct ? m.qa : m.qaT;   // [h][t][KVR]  (direct: written straight into qa)
+            float* latT = direct ? m.lat : m.latT;
+            float* vbT = direct ? m.vb : m.vbT;
             // q: q_b, then the absorbed query q_abs[h] = wk_b[h] . q[h] (256 -> 512), head by head
             mmvq(wqb, m.qr, (int) QLR, m.qb, (int) (NH * QK), n, m.q8, cs);
-            glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);                      // [h][t][QK]
-            native_quantize_q8_1(m.qT, m.q8, (int) (QK * NH * n), 1, cs);   // NH*n contiguous columns as one vector
+            if (!direct) glm5_transpose_abd(m.qb, m.qT, n, (int) NH, (int) QK, cs);         // [h][t][QK]
+            native_quantize_q8_1(qT, m.q8, (int) (QK * NH * n), 1, cs);     // NH*n contiguous columns as one vector
             {
                 const size_t row = (size_t) (QK / 32) * 34, qcol = (size_t) (QK / 32) * 36;
-                // one token: the heads in one launch (2026-10-10; STRATA_GLM5_ABSORB_BATCH=0: head by head)
-                if (!(n == 1 && absorb_batch && wkb->native_type == 8 &&
-                      native_mmvq_batched_q8_0(wkb->native_data, (size_t) KVR * row, m.q8, qcol, m.qaT, (size_t) KVR,
-                                               (int) QK, (int) KVR, (int) NH, cs)))
+                // the heads in one launch (2026-10-10; STRATA_GLM5_ABSORB_BATCH=0: head by head).  Head h, token t:
+                // [h][t] = q8 block (h * n + t) * qcol / out (h * n + t) * KVR; direct [t][h] = (t * NH + h)
+                const size_t xs = direct ? qcol : n * qcol, xc = direct ? NH * qcol : qcol;
+                const size_t ys = direct ? (size_t) KVR : n * KVR, yc = direct ? (size_t) (NH * KVR) : (size_t) KVR;
+                const bool done = (abat || (n == 1 && absorb_batch && wkb->native_type == 8)) &&
+                                  native_mmvq_batched_q8_0(wkb->native_data, (size_t) KVR * row, m.q8, xs, qaT, ys,
+                                                           (int) QK, (int) KVR, (int) NH, cs, n, xc, yc);
+                if (!done && direct && n > 1) { err = "verify glm5: the batched wk_b launch was refused"; return false; }
+                if (!done) {
                     for (int64_t h = 0; h < NH; ++h)
                         native_mmvq(wkb->native_type, (const uint8_t*) wkb->native_data + (size_t) h * KVR * row,
-                                    m.q8 + (size_t) h * n * qcol, m.qaT + (size_t) h * n * KVR, (int) QK, (int) KVR, n, cs);
+                                    m.q8 + (size_t) h * n * qcol, qaT + (size_t) h * n * KVR, (int) QK, (int) KVR, n, cs);
+                }
             }
-            glm5_transpose_abd(m.qaT, m.qa, (int) NH, n, (int) KVR, cs);                    // [t][h][KVR]
+            if (!direct) glm5_transpose_abd(m.qaT, m.qa, (int) NH, n, (int) KVR, cs);       // [t][h][KVR]
             // the indexer: keys and gates of these tokens into the pool (tail snapshot first, for the commit)
             copy_from_mapped(m.tail_snap + (size_t) qi * 3 * 2 * ID, tail, 3 * 2 * ID, cs);
             const Glm5KpoolBuffers kb{tail, pooled};
@@ -392,18 +417,23 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             if (m.lat_q4) mla_decode_attn_batch_q4(m.qa, lat_pool, m.page_table, 4, sel_, step_, cap_, (int) NH, 1.0f / std::sqrt((float) QK), m.mla_scratch, m.lat, n, cs);
             else mla_decode_attn_batch(m.qa, (const uint16_t*) lat_pool, m.page_table, 4, sel_, step_, cap_, (int) NH, 1.0f / std::sqrt((float) QK),
                                   m.mla_scratch, m.lat, n, cs);
-            glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);                  // [h][t][KVR]
-            native_quantize_q8_1(m.latT, m.q8, (int) (KVR * NH * n), 1, cs);
+            if (!direct) glm5_transpose_abd(m.lat, m.latT, n, (int) NH, (int) KVR, cs);     // [h][t][KVR]
+            native_quantize_q8_1(latT, m.q8, (int) (KVR * NH * n), 1, cs);
             {
                 const size_t row = (size_t) (KVR / 32) * 34, qcol = (size_t) (KVR / 32) * 36;
-                if (!(n == 1 && absorb_batch && wvb->native_type == 8 &&
-                      native_mmvq_batched_q8_0(wvb->native_data, (size_t) VD * row, m.q8, qcol, m.vbT, (size_t) VD,
-                                               (int) KVR, (int) VD, (int) NH, cs)))
+                const size_t xs = direct ? qcol : n * qcol, xc = direct ? NH * qcol : qcol;
+                const size_t ys = direct ? (size_t) VD : n * VD, yc = direct ? (size_t) (NH * VD) : (size_t) VD;
+                const bool done = (abat || (n == 1 && absorb_batch && wvb->native_type == 8)) &&
+                                  native_mmvq_batched_q8_0(wvb->native_data, (size_t) VD * row, m.q8, xs, vbT, ys,
+                                                           (int) KVR, (int) VD, (int) NH, cs, n, xc, yc);
+                if (!done && direct && n > 1) { err = "verify glm5: the batched wv_b launch was refused"; return false; }
+                if (!done) {
                     for (int64_t h = 0; h < NH; ++h)
                         native_mmvq(wvb->native_type, (const uint8_t*) wvb->native_data + (size_t) h * VD * row,
-                                    m.q8 + (size_t) h * n * qcol, m.vbT + (size_t) h * n * VD, (int) KVR, (int) VD, n, cs);
+                                    m.q8 + (size_t) h * n * qcol, vbT + (size_t) h * n * VD, (int) KVR, (int) VD, n, cs);
+                }
             }
-            glm5_transpose_abd(m.vbT, m.vb, (int) NH, n, (int) VD, cs);                     // [t][h][VD]
+            if (!direct) glm5_transpose_abd(m.vbT, m.vb, (int) NH, n, (int) VD, cs);        // [t][h][VD]
             mmvq(wo, m.vb, (int) (NH * VD), bo_, (int) N, n, m.q8, cs);
         }
         // ---- the FFN side
@@ -415,7 +445,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
             NativeSharedWeights nw;
             nw.gate_type = wg->native_type; nw.gate_data = wg->native_data; nw.up_type = wu->native_type; nw.up_data = wu->native_data;
             nw.down_type = wd->native_type; nw.down_data = wd->native_data; nw.q8_1 = m.q8;
-            shared_expert_multi(n, xm, nullptr, nw, nullptr, m.dg, m.du, sh_g_, bo_, N, m.NFFD, cs, nullptr, 0, m.clamp_sh);
+            shared_expert_multi(n, xm, nullptr, nw, nullptr, m.dg, m.du, sh_g_, bo_, N, m.NFFD, cs, nullptr, shexp_lfuse, m.clamp_sh);
             doorbell_ring(m_seq_, cs);   // no experts: the host skips this layer's pool and raises its flags
             return true;
         }
@@ -429,7 +459,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
         NativeSharedWeights nsw;
         nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data; nsw.up_type = wsu->native_type;
         nsw.up_data = wsu->native_data; nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data; nsw.q8_1 = m.q8;
-        shared_expert_multi(n, xm, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_, shared_, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
+        shared_expert_multi(n, xm, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_, shared_, N, m.NFF, cs, nullptr, shexp_lfuse, m.clamp_sh);
         quantize_q8_1_rows(xm, n, N, nat_xq_, cs);
         return true;
     };

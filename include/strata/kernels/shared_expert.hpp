@@ -83,6 +83,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready = nullptr,
                          int lfuse = 0,   // S26 STRATA_LFUSE: bit 0 gate computed + applied by the caller, bit 1 gate/up pair
+                                          // (2-8 tokens), bit 2 (2026-10-17) gate/up as one table launch for one Q8_0 token
                          float swiglu_limit = 0.f);
 
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
