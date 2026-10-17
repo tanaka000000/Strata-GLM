@@ -8,6 +8,7 @@
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
+// GLM (clamped SwiGLU, opt-in STRATA_GLM_IQ512): IQ3_S and IQ4_XS (23) rows with vpdpwssd, iq512_glm_gu / _rows.
 #include "strata/kernels/cpu/iq_avx512.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -240,6 +241,138 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
+// ---- GLM (2026-10-17, STRATA_GLM_IQ512): IQ3_S gate/up and IQ4_XS down rows, opt-in.  64 values decoded once per
+// chunk, then every token: a masked subtract (the weight's sign onto the activation), a maddubs and a vpdpwssd
+// (AVX512-VNNI: the scale madd and the add in one uop).  Two rows per loop (an expert's gate and up row, or two down
+// rows): a lone row's gathers and integer chain leave the core waiting.  The integer sums are ggml's (quants.c, the
+// `_generic` references), per block times d_x * d_y; only the order of the float additions differs.  The clamp and
+// SiLU stay in native_gu_rows (native_swiglu), as on the AVX-2 path.
+template <int TY> struct GlmFmt;
+
+template <> struct GlmFmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
+    static constexpr int bytes = 110;
+    // the 8 half-block scales 2s+1 as int16 lanes 0-7 (half h = 32 values: nibble h&1 of scales[h/2])
+    static inline __m128i scales(const uint8_t* b) {
+        const __m128i x = _mm_cvtsi32_si128((int) u32(b + 106)), m4 = _mm_set1_epi8(15);
+        const __m128i n = _mm_unpacklo_epi8(_mm_and_si128(x, m4), _mm_and_si128(_mm_srli_epi16(x, 4), m4));
+        return _mm_add_epi16(_mm_slli_epi16(_mm_cvtepu8_epi16(n), 1), _mm_set1_epi16(1));
+    }
+    // values 64j..64j+63: grid magnitudes (one gather of the 16 9-bit indices) and the 64 sign bits
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m) {
+        __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) (b + 2 + 16 * j)));
+        idx = _mm512_mask_or_epi32(idx, _load_mask16((__mmask16*) (b + 66 + 2 * j)), idx, _mm512_set1_epi32(256));
+        g = _mm512_i32gather_epi32(idx, (const int*) iq3s_grid, 4);
+        m = _load_mask64((__mmask64*) (b + 74 + 8 * j));
+    }
+};
+
+template <> struct GlmFmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128]
+    static constexpr int bytes = 136;
+    // the 8 sub-block scales (6 bits: a nibble of scales_l and 2 bits of scales_h) - 32, signed int16 lanes 0-7
+    static inline __m128i scales(const uint8_t* b) {
+        const __m128i x = _mm_cvtsi32_si128((int) u32(b + 4)), m4 = _mm_set1_epi8(15);
+        const __m128i lo = _mm_cvtepu8_epi16(
+            _mm_unpacklo_epi8(_mm_and_si128(x, m4), _mm_and_si128(_mm_srli_epi16(x, 4), m4)));
+        const __m128i hi = _mm_and_si128(_mm_srlv_epi16(_mm_set1_epi16((short) u16(b + 2)),
+                                                        _mm_setr_epi16(0, 2, 4, 6, 8, 10, 12, 14)),
+                                         _mm_set1_epi16(3));
+        return _mm_sub_epi16(_mm_or_si128(lo, _mm_slli_epi16(hi, 4)), _mm_set1_epi16(32));
+    }
+    // values 64j..64j+63 = sub-blocks 2j, 2j+1 (16 qs bytes each: low nibbles values 0-15, high 16-31).  The 32 bytes
+    // go to 128-bit lanes [A, A, B, B], the odd lanes shifted down a nibble, and vpermb looks the codebook up from the
+    // low 6 index bits (the table repeated 4x, so bits 4-5 need no mask).  |w| for maddubs, w's sign as the mask.
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m) {
+        const __m512i table = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*) kvalues_iq4nl));
+        const long long s4 = 0x0004000400040004ll;
+        const __m512i shifts = _mm512_set_epi64(s4, s4, 0, 0, s4, s4, 0, 0);
+        __m512i x = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i*) (b + 8 + 32 * j)));
+        x = _mm512_srlv_epi16(_mm512_shuffle_i64x2(x, x, _MM_SHUFFLE(1, 1, 0, 0)), shifts);
+        const __m512i w = _mm512_permutexvar_epi8(x, table);
+        m = _mm512_movepi8_mask(w);
+        g = _mm512_abs_epi8(w);
+    }
+};
+
+// ra . y[t] -> oa[t] and rb . y[t] -> ob[t], NT <= 4 (32 registers: 4 accumulators per token and row pair)
+template <int TY, int NT>
+inline void glm_dot2(const uint8_t* ra, const uint8_t* rb, int nb, const block_q8_K* const* y, float* oa, float* ob) {
+    __m512 fa[NT], fb[NT];
+    for (int t = 0; t < NT; ++t) { fa[t] = _mm512_setzero_ps(); fb[t] = _mm512_setzero_ps(); }
+    const __m512i zero = _mm512_setzero_si512();
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t* ba = ra + (size_t) i * GlmFmt<TY>::bytes;
+        const uint8_t* bb = rb + (size_t) i * GlmFmt<TY>::bytes;
+        if (prefetch_ahead > 0) {
+            _mm_prefetch((const char*) ba + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) ba + prefetch_ahead + 64, _MM_HINT_T0);
+            _mm_prefetch((const char*) bb + prefetch_ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) bb + prefetch_ahead + 64, _MM_HINT_T0);
+        }
+        const __m512i sa8 = _mm512_castsi128_si512(GlmFmt<TY>::scales(ba));
+        const __m512i sb8 = _mm512_castsi128_si512(GlmFmt<TY>::scales(bb));
+        __m512i ia[NT], ib[NT];
+        for (int t = 0; t < NT; ++t) { ia[t] = _mm512_setzero_si512(); ib[t] = _mm512_setzero_si512(); }
+        for (int j = 0; j < 4; ++j) {
+            // int16 lanes 0-15 (values 0-31 of the chunk) take half 2j's scale, lanes 16-31 half 2j+1's
+            const __m512i sel = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16((short) (2 * j)),
+                                                        _mm512_set1_epi16((short) (2 * j + 1)));
+            __m512i ga, gb;
+            __mmask64 ma, mb;
+            GlmFmt<TY>::decode(ba, j, ga, ma);
+            GlmFmt<TY>::decode(bb, j, gb, mb);
+            const __m512i ca = _mm512_permutexvar_epi16(sel, sa8), cb = _mm512_permutexvar_epi16(sel, sb8);
+            for (int t = 0; t < NT; ++t) {
+                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                ia[t] = _mm512_dpwssd_epi32(ia[t], _mm512_maddubs_epi16(ga, _mm512_mask_sub_epi8(yv, ma, zero, yv)), ca);
+                ib[t] = _mm512_dpwssd_epi32(ib[t], _mm512_maddubs_epi16(gb, _mm512_mask_sub_epi8(yv, mb, zero, yv)), cb);
+            }
+        }
+        const float dxa = h2f(u16(ba)), dxb = h2f(u16(bb));
+        for (int t = 0; t < NT; ++t) {
+            fa[t] = _mm512_fmadd_ps(_mm512_set1_ps(dxa * y[t][i].d), _mm512_cvtepi32_ps(ia[t]), fa[t]);
+            fb[t] = _mm512_fmadd_ps(_mm512_set1_ps(dxb * y[t][i].d), _mm512_cvtepi32_ps(ib[t]), fb[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) { oa[t] = _mm512_reduce_add_ps(fa[t]); ob[t] = _mm512_reduce_add_ps(fb[t]); }
+}
+
+// step 1: two matrices row by row (wa row r -> oa, wb row r -> ob).  step 2 (down): wb = wa + one row, rows r and
+// r+1 per loop, both into oa
+template <int TY, int NT>
+void glm_rows2(const uint8_t* wa, const uint8_t* wb, size_t row_bytes, int step, int n, const block_q8_K* const* y,
+               float* const* oa, float* const* ob, int r0, int r1) {
+    float a[NT], b[NT];
+    for (int r = r0; r < r1; r += step) {
+        // ponytail: an odd last down row runs as a pair with itself (one wasted row per call)
+        const bool pair = step == 1 || r + 1 < r1;
+        const uint8_t* ra = wa + (size_t) r * row_bytes;
+        glm_dot2<TY, NT>(ra, pair ? wb + (size_t) r * row_bytes : ra, n / QK_K, y, a, b);
+        for (int t = 0; t < NT; ++t) {
+            oa[t][r] = a[t];
+            if (step == 1) ob[t][r] = b[t];
+            else if (pair) oa[t][r + 1] = b[t];
+        }
+    }
+}
+
+template <int TY>
+void glm_rows2_nt(int nt, const uint8_t* wa, const uint8_t* wb, size_t row_bytes, int step, int n,
+                  const void* const* act, float* const* oa, float* const* ob, int r0, int r1) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {   // tokens in groups of up to 4 (the registers)
+        const block_q8_K* y[4];
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        for (int t = 0; t < k; ++t) y[t] = (const block_q8_K*) act[t0 + t];
+        float* const* a = oa + t0;
+        float* const* b = step == 1 ? ob + t0 : nullptr;
+        switch (k) {
+            case 1: glm_rows2<TY, 1>(wa, wb, row_bytes, step, n, y, a, b, r0, r1); break;
+            case 2: glm_rows2<TY, 2>(wa, wb, row_bytes, step, n, y, a, b, r0, r1); break;
+            case 3: glm_rows2<TY, 3>(wa, wb, row_bytes, step, n, y, a, b, r0, r1); break;
+            default: glm_rows2<TY, 4>(wa, wb, row_bytes, step, n, y, a, b, r0, r1); break;
+        }
+    }
+}
+
 }  // namespace
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
@@ -264,6 +397,18 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
+}
+
+void iq512_glm_gu(int type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n, const void* const* act, int nt,
+                  float* const* g, float* const* u, int r0, int r1) {
+    if (type == 21) glm_rows2_nt<21>(nt, blob, blob + up_off, row_bytes, 1, n, act, g, u, r0, r1);
+    else if (type == 23) glm_rows2_nt<23>(nt, blob, blob + up_off, row_bytes, 1, n, act, g, u, r0, r1);
+}
+
+void iq512_glm_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1) {
+    if (type == 21) glm_rows2_nt<21>(nt, w, w + row_bytes, row_bytes, 2, n, act, out, nullptr, r0, r1);
+    else if (type == 23) glm_rows2_nt<23>(nt, w, w + row_bytes, row_bytes, 2, n, act, out, nullptr, r0, r1);
 }
 
 }  // namespace strata::kernels::cpu

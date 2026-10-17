@@ -44,6 +44,10 @@ struct ExpertLayout {
 /// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
 /// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).
 bool cpu_avx512_ok();
+/// The same probe without STRATA_FORCE_AVX2 (STRATA_FORCE_ISA still caps it): what the CPU really runs.  For opt-in
+/// AVX-512 kernels that must stay reachable while FORCE_AVX2 keeps the rest of the engine on the AVX-2 paths
+/// (STRATA_GLM_IQ512).
+bool cpu_avx512_hw_ok();
 /// Whether this CPU runs AVX-512F + AVX-512BW + AVX-512VL + AVX-512DQ (e.g. Skylake-X i9-9920X) for iq_avx512.cpp.
 bool cpu_avx512bw_ok();
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel

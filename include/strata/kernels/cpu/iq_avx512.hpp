@@ -15,4 +15,13 @@ void iq512_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_
 void iq512_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                 float* const* out, int r0, int r1);
 
+/// GLM (STRATA_GLM_IQ512): IQ3_S (21) / IQ4_XS (23) rows, any nt.  Needs AVX512 F/BW/VL/VNNI/VBMI (cpu_avx512_hw_ok).
+bool iq512_glm_supported(int ggml_type) noexcept;
+/// g[t][r] = gate_r . a[t], u[t][r] = up_r . a[t] (no SwiGLU: the caller clamps), rows [r0, r1).
+void iq512_glm_gu(int ggml_type, const uint8_t* blob, size_t row_bytes, size_t up_off, int n, const void* const* act,
+                  int nt, float* const* g, float* const* u, int r0, int r1);
+/// out[t][r] = w_r . a[t], rows [r0, r1).
+void iq512_glm_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                    float* const* out, int r0, int r1);
+
 }  // namespace strata::kernels::cpu

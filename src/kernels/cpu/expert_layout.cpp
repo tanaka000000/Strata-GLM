@@ -41,6 +41,13 @@ int cpu_isa_cap() {
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+        return cpu_avx512_hw_ok();
+    }();
+    return ok;
+}
+
+bool cpu_avx512_hw_ok() {
+    static const bool ok = [] {
         if (cpu_isa_cap() < 3) return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {

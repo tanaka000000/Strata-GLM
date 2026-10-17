@@ -44,6 +44,18 @@ bool iq256_supported(int type) noexcept {
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
 
+bool iq512_glm_supported(int type) noexcept { return type == 21 || type == 23; }
+
+namespace {
+// STRATA_GLM_IQ512=1 (opt-in, 2026-10-17): GLM's rows (clamped SwiGLU) through iq512_glm_gu / iq512_glm_rows where the
+// CPU really has AVX-512 - probed without STRATA_FORCE_AVX2, which keeps every other kernel on its AVX-2 path.
+bool glm_iq512_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GLM_IQ512"); return v != nullptr && std::atoi(v) != 0; }() &&
+                           cpu_avx512_hw_ok();
+    return on;
+}
+}  // namespace
+
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 float swiglu_limit) {
     if (gu_type < 0 || gu_type >= GGML_TYPE_COUNT || d_type < 0 || d_type >= GGML_TYPE_COUNT ||
@@ -190,15 +202,19 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     const int glm_from = mt_env ? std::max(mt_min, glm_min) : glm_min;
     // STRATA_GLM_PAIR=0: gate and up one after the other (iq256_rows) instead of side by side (the same bits)
     static const bool glm_pair = [] { const char* v = std::getenv("STRATA_GLM_PAIR"); return !(v && v[0] == '0'); }();
-    if (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= glm_from && nt <= 8 && iq256_supported(f.gu_type)) {
+    // STRATA_GLM_IQ512=1: the AVX-512 rows (gate and up side by side) from one token on, before the AVX-2 ones
+    const bool glm512 = f.swiglu_limit > 0.f && nt <= 8 && glm_iq512_on() && iq512_glm_supported(f.gu_type);
+    if (glm512 || (f.swiglu_limit > 0.f && glm_mt && avx2 && !cpu512 && nt >= glm_from && nt <= 8 && iq256_supported(f.gu_type))) {
         thread_local std::vector<float> gb, ub;
         const size_t span = (size_t) r1;
         if (gb.size() < span * nt) { gb.resize(span * nt); ub.resize(span * nt); }
         float* gp[8];
         float* up[8];
         for (int t = 0; t < nt; ++t) { gp[t] = gb.data() + t * span; up[t] = ub.data() + t * span; }
-        // one token only: at two the pair loop runs out of registers (P-core 1.38 -> 1.51 ms an expert; one: 1.18 -> 1.13)
-        if (!glm_pair || nt != 1 ||
+        if (glm512) {
+            iq512_glm_gu(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, gp, up, r0, r1);
+        // AVX-2: the pair for one token only (at two it runs out of registers: P-core 1.38 -> 1.51 ms; one: 1.18 -> 1.13)
+        } else if (!glm_pair || nt != 1 ||
             !iq256_gu_pair(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, gp, up, r0, r1)) {
             iq256_rows(f.gu_type, blob, f.gu_row, (int) f.n_embd, act, nt, gp, r0, r1);
             iq256_rows(f.gu_type, blob + f.up_off, f.gu_row, (int) f.n_embd, act, nt, up, r0, r1);
@@ -250,6 +266,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     }();
     static const int glm_from = std::getenv("STRATA_IQ_MT_MIN") ? std::max(mt_min, glm_min) : glm_min;   // as gate/up
     static const bool glm_pair = [] { const char* v = std::getenv("STRATA_GLM_PAIR"); return !(v && v[0] == '0'); }();
+    if (f.swiglu_limit > 0.f && glm_iq512_on() && iq512_glm_supported(f.d_type)) {   // STRATA_GLM_IQ512=1, any nt
+        iq512_glm_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     if (f.swiglu_limit > 0.f && glm_mt && !cpu512 && nt >= glm_from && iq256_supported(f.d_type) &&
         std::getenv("STRATA_NO_IQ256") == nullptr) {
         if (!glm_pair || nt != 1 || !iq256_rows_pair(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1))

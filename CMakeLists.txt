@@ -1271,6 +1271,13 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
   endif()
+  # the GLM AVX-512 rows (STRATA_GLM_IQ512: IQ3_S gate/up, IQ4_XS down) against ggml-cpu's dot and the AVX-2 rows, 1..8
+  # tokens, and the engine's dispatch with the clamp; skips on a CPU without AVX-512
+  add_executable(iq_glm512_parity src/kernels/cpu/iq_glm512_parity.cpp)
+  target_link_libraries(iq_glm512_parity PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME iq_glm512_parity COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:iq_glm512_parity>)
+  endif()
   # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
   add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
   target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
