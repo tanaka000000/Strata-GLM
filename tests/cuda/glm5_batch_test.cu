@@ -4,8 +4,8 @@
 //   1. bitwise: the table launch (2-8 columns) against the separate native_mmvq calls; the batched per-head launch
 //      on [token][head] layouts (strided columns, no transposes) against the per-head calls on the transposed
 //      layout; and every column of a multi-column call against a one-column call on that column.
-//   2. a hash of every output, so a run with STRATA_MMVQ_ROWS=2 / 4 can be compared with a default run (same lines).
-//      Likewise STRATA_MHC_FAST=1 and STRATA_F32_GEMV_FAST=1 (the mHC read, the router / indexer F32 GEMV).
+//   2. a hash of every output, so a run with STRATA_MMVQ_ROWS (or STRATA_MMVQ_TABLE_ROWS) = 2 / 4 can be compared with
+//      a default run (same lines).  Likewise STRATA_MHC_FAST=1 and STRATA_F32_GEMV_FAST=1 (the mHC read, the router / indexer F32 GEMV).
 //   3. speed: each path captured in a CUDA graph (as the engine runs it), weights rotated through ~400 MB so the
 //      5090's L2 does not hold them; us per call and the weight bytes / time.
 #include "strata/kernels/fused_gr.hpp"
@@ -41,7 +41,7 @@ static uint8_t* wat(size_t off) { return pool + off; }
 static float* fdev(size_t n) {   // random floats in [-1, 1)
     std::vector<float> h(n);
     for (auto& v : h) v = (float) ((int) (nxt() % 20001) - 10000) / 10000.0f;
-    float* d; CK(cudaMalloc(&d, n * 4)); CK(cudaMemcpy(d, h.data(), n * 4, cudaMemcpyHostToDevice));
+    float* d; CK(cudaMalloc(&d, n * 4)); CK(cudaMemcpy(d, h.data(), n * 4, cudaMemcpyHostToDevice)); CK(cudaDeviceSynchronize());   // a pageable copy may still be in flight; st does not wait for it
     return d;
 }
 static std::vector<float> get(const float* d, size_t n) { std::vector<float> h(n); CK(cudaMemcpy(h.data(), d, n * 4, cudaMemcpyDeviceToHost)); return h; }
@@ -176,7 +176,8 @@ static void plain_case(const char* name, int n_in, int n_out, int max_n) {
         native_mmvq(8, wat(0), q8, y, n_in, n_out, n, st);
         CK(cudaStreamSynchronize(st));
         char t[128]; std::snprintf(t, sizeof t, "%s %d->%d n=%d (%.1f MB)", name, n_in, n_out, n, set / 1e6);
-        std::printf("  %-58s hash %016llx\n", t, (unsigned long long) fnv(get(y, (size_t) n * n_out)));
+        const auto yv = get(y, (size_t) n * n_out);
+        std::printf("  %-58s hash %016llx  y[0..2] %g %g %g\n", t, (unsigned long long) fnv(yv), yv[0], yv[1], yv[2]);
         report("", timed([&](int c) { native_mmvq(8, wat(c * set), q8, y, n_in, n_out, n, st); }, copies), set);
     }
     cudaFree(x); cudaFree(y); cudaFree(q8);
@@ -260,9 +261,12 @@ int main(int argc, char** argv) {
         }
         CK(cudaMalloc(&pool, pool_bytes));
         CK(cudaMemcpy(pool, h.data(), pool_bytes, cudaMemcpyHostToDevice));
+        CK(cudaDeviceSynchronize());
     }
     const char* rows = std::getenv("STRATA_MMVQ_ROWS");
-    std::printf("glm5_batch_test: %d calls per timing, STRATA_MMVQ_ROWS=%s\n", reps, rows ? rows : "(unset)");
+    const char* trows = std::getenv("STRATA_MMVQ_TABLE_ROWS");
+    std::printf("glm5_batch_test: %d calls per timing, STRATA_MMVQ_ROWS=%s STRATA_MMVQ_TABLE_ROWS=%s\n", reps,
+                rows ? rows : "(unset)", trows ? trows : "(unset)");
     table_case("KDA projections", 4096, {8192, 8192, 8192, 128, 128, 64}, 3);
     table_case("DSA projections", 4096, {1536, 512, 128, 128}, 3);
     absorb_case("MLA wk_b (q -> q_abs)", 256, 512, 64, 3);

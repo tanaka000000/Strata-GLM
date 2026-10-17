@@ -1663,9 +1663,16 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 #endif
 
 // STRATA_MMVQ_ROWS=2|4 (2026-10-17, opt-in): rows per block of the single-column large-K Q4_0/Q5_0/Q8_0/IQ4_NL layout
-// (plain, table and batched launches); each row's output is bitwise the default's.  Read once; set before capture.
+// (plain and batched launches); STRATA_MMVQ_TABLE_ROWS=2|4 the same for the table launch, whose blocks past a short
+// member's rows then also leave at once (RTX 5090, GLM's KDA table 74.1 -> 68.1 us; single matrices were slower
+// with 2: tests/cuda/glm5_batch_test.cu).  Each row's output is bitwise the default's.  Read once; set before capture.
+static int rows_env(const char* name) { const char* v = std::getenv(name); const int x = v ? std::atoi(v) : 1; return x == 2 || x == 4 ? x : 1; }
 static int mmvq_rows() {
-    static const int r = [] { const char* v = std::getenv("STRATA_MMVQ_ROWS"); const int x = v ? std::atoi(v) : 1; return x == 2 || x == 4 ? x : 1; }();
+    static const int r = rows_env("STRATA_MMVQ_ROWS");
+    return r;
+}
+static int mmvq_table_rows() {
+    static const int r = rows_env("STRATA_MMVQ_TABLE_ROWS");
     return r;
 }
 static unsigned rows_grid(int n_out, int r) { return unsigned((std::size_t(n_out) + r - 1) / r); }
@@ -2575,9 +2582,9 @@ bool native_mmvq_table_q8_0(const void* const* weights, const int* n_out, int n_
     } else if (n_in / 32 < 2 * WARPS * WARP / Qi) {
         const unsigned blocks = unsigned((std::size_t(n_max) + WARPS - 1) / WARPS);
         native_small_mmvq_table_kernel<Q80Block, Qi, true><<<dim3(blocks, unsigned(n_batch)), threads, 0, s>>>(t, x, n_in);
-    } else if (mmvq_rows() == 2) {
+    } else if (mmvq_table_rows() == 2) {
         native_small_mmvq_table_kernel<Q80Block, Qi, false, 2><<<dim3(rows_grid(n_max, 2), unsigned(n_batch)), threads, 0, s>>>(t, x, n_in);
-    } else if (mmvq_rows() == 4) {
+    } else if (mmvq_table_rows() == 4) {
         native_small_mmvq_table_kernel<Q80Block, Qi, false, 4><<<dim3(rows_grid(n_max, 4), unsigned(n_batch)), threads, 0, s>>>(t, x, n_in);
     } else {
         native_small_mmvq_table_kernel<Q80Block, Qi, false><<<dim3(unsigned(n_max), unsigned(n_batch)), threads, 0, s>>>(t, x, n_in);
