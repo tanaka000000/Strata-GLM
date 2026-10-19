@@ -13149,6 +13149,23 @@ int main(int argc, char** argv) {
                 ms_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
                 return true;
             };
+            // #477 for the glm5 serve loop (2026-10-20): heat1 was counted here but only the one-shot run wrote it.
+            // Written between requests, at most every --expert-profile-save-every minutes (a client that kills the
+            // engine never sends QUIT), and when the loop ends.  A swap still in flight counts as done.
+            Clock::time_point glm_profile_saved_at = Clock::now();
+            auto glm_save_profile = [&](const char* why) {
+                if (heat1.empty()) return;
+                std::vector<uint8_t> resident(host_res.size(), 0);
+                for (size_t i = 0; i < host_res.size(); ++i) resident[i] = host_res[i] >= 0;
+                for (const auto& p : pending) resident[(size_t) p.first] = 1;
+                std::string e;
+                const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat1, profile_loaded);
+                if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+                    std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(), why);
+                else
+                    std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
+                glm_profile_saved_at = Clock::now();
+            };
             for (;;) {
                 std::string line;
                 {
@@ -13501,6 +13518,9 @@ int main(int argc, char** argv) {
                                      "(%.2f tok/s), %s\n", (long long) n, (long long) reused, prompt_ms,
                              (long long) produced_n, decode_ms, decode_ms > 0 ? 1000.0 * (double) produced_n / decode_ms : 0.0,
                              cancelled ? "cancel" : finish);
+                if (!o.expert_profile_save.empty() && o.expert_profile_save_min > 0 &&
+                    Clock::now() - glm_profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
+                    glm_save_profile("periodic");
                 // where a window's time went (2026-10-08): per verifier, GPU (waiting for each layer's doorbell), the
                 // CPU experts, staging; per stage link, the round trip (the stage's compute included)
                 auto vstat = [&](const char* nm, strata::core::Verifier& v) {
@@ -13556,6 +13576,7 @@ int main(int argc, char** argv) {
                     lk.windows = 0;
                 }
             }
+            if (!o.expert_profile_save.empty()) glm_save_profile("exit");
             return 0;
         }
         if (prompt_windows) {   // glm5-next: no prompt path yet - the prompt's positions [0, n_prompt - 1) as verify windows
