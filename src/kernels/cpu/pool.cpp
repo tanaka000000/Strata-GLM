@@ -142,6 +142,14 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
                 topo.host_core = topo.worker_cores.front();
                 topo.worker_cores.erase(topo.worker_cores.begin());
             }
+            // STRATA_POOL_SMT=1 (opt-in, 2026-10-20): after one worker per core, the cores' SMT siblings (not the host
+            // core's), so --pool-workers above the core count pins them too.  The expert rows are bound by RAM; a second
+            // thread per core may keep more reads in flight.  Off: the list is as before.
+            // shortcut: not with --host-core last (it takes the list's last entry, a sibling here); add it there if needed
+            if (const char* v = std::getenv("STRATA_POOL_SMT"); v && v[0] == '1' && host_core_setting() != HostCore::Last)
+                for (const auto& c : descs)
+                    if (c.lps[0] != topo.host_core)
+                        for (size_t s = 1; s < c.lps.size(); ++s) topo.worker_cores.push_back(c.lps[s]);
             return topo;
         }
 
