@@ -9,6 +9,27 @@ RTX 5090 + 128 GB RAM + NVMe: **31.3 tokens/s** on a short chat (median of 3; be
 
 **English** · [日本語](README.ja.md)
 
+## This fork (tanaka000000/Strata-GLM)
+
+A fork of [isichan-ai/Strata-GLM](https://github.com/isichan-ai/Strata-GLM), not affiliated with its author. `main` is
+kept equal to the author's `main`; the changes are on `glm-tanaka` (the default branch). With none of the switches
+below set, the engine runs as the author's does.
+
+- **Thinking off and the effort level, from the request (GLM-5.3)**, and a restart for an engine that answers one
+  token forever: the last two entries of "Update 2026-10-13" below.
+- **CPU, opt-in:** `STRATA_GLM_IQ512=1` (AVX-512 for the GLM expert rows), `STRATA_POOL_PROF=1` (the native phases'
+  times), `STRATA_POOL_NOPARK` / `STRATA_POOL_PAR_QUANT` / `STRATA_POOL_FUSE`, `STRATA_POOL_SMT=1` (workers past the
+  core count pinned to each core's second thread).
+- **GPU, opt-in:** `STRATA_GLM5_BATCH_MAXT=2..8` (batched launches for 2-8 token windows), `STRATA_GLM5_SKIP_T1`,
+  `STRATA_GLM5_MTP_BATCH`, `STRATA_GLM5_SHEXP_PAIR`, `STRATA_MMVQ_ROWS`, `STRATA_MMVQ_TABLE_ROWS`, `STRATA_MHC_FAST`,
+  `STRATA_F32_GEMV_FAST`. The commit messages say which give bitwise the same results.
+- **Server:** `--expert-profile-save` is written by the GLM server too (every `--expert-profile-save-every` minutes
+  after a request, and at exit).
+- **Measured** (RTX 5090, Xeon 658X, Windows 11): `STRATA_POOL_SMT=1` with 30 workers 22.4 ms against 24.0-25.3 ms
+  without (`glm_expert_bench`: GLM shapes, 45 layers x 8 experts, 2 tokens, 20 windows); `STRATA_MMVQ_TABLE_ROWS=2`
+  the KDA projection table 79.0-80.7 to 71.8-72.7 us (`glm5_batch_test`). Tokens/s of the whole model with these
+  switches are not measured yet; the numbers below are the author's PC.
+
 > **Unofficial fork, not affiliated with or endorsed by the Strata authors.**
 
 This is a fork of [Strata](https://github.com/Niko1221/Strata) (v0.1.41, MIT) that runs **GLM-5.3-Flash**

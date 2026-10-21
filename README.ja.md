@@ -9,6 +9,27 @@ RTX 5090＋RAM 128GB＋NVMe で、短い会話の生成 **31.3 tok/s**（3回の
 
 [English](README.md) · **日本語**
 
+## このフォークについて（tanaka000000/Strata-GLM）
+
+[isichan-ai/Strata-GLM](https://github.com/isichan-ai/Strata-GLM) のフォークです。その作者とは関係がありません。`main` は
+作者の `main` と同じに保ち、変更は `glm-tanaka`（既定のブランチ）にあります。下の切り替えをどれも付けなければ、
+エンジンは作者の版と同じに動きます。
+
+- **思考オフと effort をリクエストで指定（GLM-5.3）**と、1トークンだけを返し続けるエンジンの再起動：下の
+  「2026-10-13 の更新」の最後の2項目。
+- **CPU（opt-in）：** `STRATA_GLM_IQ512=1`（GLM の専門家の行を AVX-512 で計算）、`STRATA_POOL_PROF=1`（各段の時間）、
+  `STRATA_POOL_NOPARK`・`STRATA_POOL_PAR_QUANT`・`STRATA_POOL_FUSE`、`STRATA_POOL_SMT=1`（コアの数を超えた作業スレッドを
+  各コアの 2 本目のスレッドに固定）。
+- **GPU（opt-in）：** `STRATA_GLM5_BATCH_MAXT=2..8`（2〜8トークンの窓をまとめて起動）、`STRATA_GLM5_SKIP_T1`、
+  `STRATA_GLM5_MTP_BATCH`、`STRATA_GLM5_SHEXP_PAIR`、`STRATA_MMVQ_ROWS`、`STRATA_MMVQ_TABLE_ROWS`、`STRATA_MHC_FAST`、
+  `STRATA_F32_GEMV_FAST`。どれが結果をビット単位で変えないかは、コミットメッセージに書いてあります。
+- **サーバー：** GLM のサーバーでも `--expert-profile-save` が書かれます（要求のあと `--expert-profile-save-every` 分ごとと、
+  終わるとき）。
+- **実測**（RTX 5090・Xeon 658X・Windows 11）：`STRATA_POOL_SMT=1` の 30 本で 22.4 ms、付けないと 24.0〜25.3 ms
+  （`glm_expert_bench`：GLM の形、45 層 × 8 専門家、2 トークン、20 窓）。`STRATA_MMVQ_TABLE_ROWS=2` で KDA の射影の表が
+  79.0〜80.7 から 71.8〜72.7 µs（`glm5_batch_test`）。これらを付けたときのモデル全体の tokens/s はまだ測っていません。
+  下の数字は作者の PC のものです。
+
 > **非公式の改造版です。元の Strata の作者とは関係がなく、公認も受けていません。**
 
 [Strata](https://github.com/Niko1221/Strata)（v0.1.41・MIT）のフォークです。**GLM-5.3-Flash**（3,200億パラメータ・
